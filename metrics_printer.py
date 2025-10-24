@@ -56,6 +56,22 @@ def print_metrics(client_metrics: BenchmarkMetrics, server_metrics: Optional[Dic
     print(f"Total Requests: {server_metrics['requests']:.0f} | Successful: {server_metrics['successful_requests']:.0f} | Aborted: {server_metrics['aborted_requests']:.0f}")
     print(f"Tokens - Prompt: {server_metrics['prompt_tokens']:.0f} | Generated: {server_metrics['generation_tokens']:.0f} | Cached: {server_metrics['cached_tokens']:.0f}")
 
+    # Calculate time breakdown between prefill and decode
+    prompt_tokens = server_metrics['prompt_tokens']
+    gen_tokens = server_metrics['generation_tokens']
+    prefill_throughput = server_metrics['prefill_throughput']['avg']
+    decode_throughput = server_metrics['decode_throughput']['avg']
+
+    if prefill_throughput > 0 and decode_throughput > 0:
+        time_prefill_sec = prompt_tokens / prefill_throughput
+        time_decode_sec = gen_tokens / decode_throughput
+        total_time_sec = time_prefill_sec + time_decode_sec
+
+        if total_time_sec > 0:
+            prefill_pct = (time_prefill_sec / total_time_sec) * 100
+            decode_pct = (time_decode_sec / total_time_sec) * 100
+            print(f"Time Breakdown - Prefill: {time_prefill_sec:.2f}s ({prefill_pct:.1f}%) | Decode: {time_decode_sec:.2f}s ({decode_pct:.1f}%)")
+
     if requests:
         avg_prompt_len = np.mean([r.prompt_length for r in requests])
         avg_image_size_kb = np.mean([r.image_size_bytes / 1024 for r in requests])
@@ -156,6 +172,20 @@ def print_prefill_decode_tables(results: List[dict], num_requests: int):
         queue_lat_p50_ms = _safe_get(sm, ["queue_latency_ms", "p50"], 0.0)
         queue_lat_avg_ms = _safe_get(sm, ["queue_latency_ms", "avg"], 0.0)
 
+        # Time breakdown calculations
+        prompt_tokens = _safe_get(sm, ["prompt_tokens"], 0.0)
+        gen_tokens = _safe_get(sm, ["generation_tokens"], 0.0)
+
+        prefill_time_pct = "N/A"
+        decode_time_pct = "N/A"
+        if prefill_avg > 0 and decode_avg > 0 and prompt_tokens > 0 and gen_tokens > 0:
+            time_prefill = prompt_tokens / prefill_avg
+            time_decode = gen_tokens / decode_avg
+            total_time = time_prefill + time_decode
+            if total_time > 0:
+                prefill_time_pct = f"{(time_prefill / total_time) * 100:.1f}%"
+                decode_time_pct = f"{(time_decode / total_time) * 100:.1f}%"
+
         prefill_rows.append([
             _fmt_int(r),
             _fmt_int(prefill_p50),
@@ -170,6 +200,7 @@ def print_prefill_decode_tables(results: List[dict], num_requests: int):
             _fmt_tokps(client_tok_p50),
             _fmt_tokps(client_tok_avg),
             success_pct,
+            prefill_time_pct,
         ])
 
         decode_rows.append([
@@ -186,6 +217,7 @@ def print_prefill_decode_tables(results: List[dict], num_requests: int):
             _fmt_tokps(client_tok_p50),
             _fmt_tokps(client_tok_avg),
             success_pct,
+            decode_time_pct,
         ])
 
     # Pretty print with tabs
@@ -193,7 +225,7 @@ def print_prefill_decode_tables(results: List[dict], num_requests: int):
         print()
         print(title)
         print("\t")
-        print("Req /s\tP50\tAvg\tAvg Batch Size\tQueue Len P50\tQueue Len Avg\tQueue Lat P50 (ms)\tQueue Lat Avg (ms)\tClient E2E P50 (sec)\tClient E2E Avg (sec)\tClient Tok/s (P50)\tClient Tok/s (Avg)\tSuccess %")
+        print("Req /s\tP50\tAvg\tAvg Batch Size\tQueue Len P50\tQueue Len Avg\tQueue Lat P50 (ms)\tQueue Lat Avg (ms)\tClient E2E P50 (sec)\tClient E2E Avg (sec)\tClient Tok/s (P50)\tClient Tok/s (Avg)\tSuccess %\tTime %")
         for row in rows:
             print("\t".join(row))
 
@@ -312,6 +344,7 @@ def plot_distribution_skewness(outputs: List[RequestOutput], outdir: str, rate_s
     fig.tight_layout()
     filename = f"distribution_skewness{rate_suffix}.png"
     filepath = os.path.join(outdir, filename)
+    os.makedirs(outdir, exist_ok=True)
     fig.savefig(filepath, dpi=150)
     plt.close(fig)
     print(f"✓ Saved distribution skewness plot to {filepath}")
@@ -424,6 +457,7 @@ def plot_server_distribution_skewness(server_metrics_before: ServerMetrics, serv
     fig.tight_layout()
     filename = f"server_distribution_skewness{rate_suffix}.png"
     filepath = os.path.join(outdir, filename)
+    os.makedirs(outdir, exist_ok=True)
     fig.savefig(filepath, dpi=150)
     plt.close(fig)
     print(f"✓ Saved server distribution skewness plot to {filepath}")
@@ -483,6 +517,7 @@ def plot_queue_metrics_timeseries(samples: List[QueueMetricsSample], output_dir:
 
     plt.tight_layout()
     outpath = os.path.join(output_dir, f"queue_timeseries{rate_suffix}.png")
+    os.makedirs(output_dir, exist_ok=True)
     plt.savefig(outpath, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"✓ Queue time-series plot saved to: {outpath}")
@@ -526,6 +561,7 @@ def plot_queue_histogram(samples: List[QueueMetricsSample], output_dir: str, rat
 
     plt.tight_layout()
     outpath = os.path.join(output_dir, f"queue_histogram{rate_suffix}.png")
+    os.makedirs(output_dir, exist_ok=True)
     plt.savefig(outpath, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"✓ Queue histogram saved to: {outpath}")
@@ -542,6 +578,7 @@ def plot_tradeoff(rates, e2e_avg_ms, decode_avg, outdir):
     ax2.plot(rates, decode_avg, marker="s", linestyle="--", label="Decode Tok/s (Avg)")
     fig.suptitle("Trade-off: User Latency vs Server Efficiency")
     fig.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
     fig.savefig(os.path.join(outdir, "tradeoff.png"))
     plt.close(fig)
 
@@ -556,6 +593,7 @@ def plot_frontier(e2e_avg_ms, decode_avg, rates, outdir):
     ax.set_ylabel("Server Decode Tok/s (Avg)")
     fig.suptitle("Efficiency Frontier (Pareto) by Request Rate")
     fig.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
     fig.savefig(os.path.join(outdir, "frontier.png"))
     plt.close(fig)
 
@@ -568,6 +606,7 @@ def plot_series_vs_rate(rates, values, ylabel, title, filename, outdir):
     ax.set_ylabel(ylabel)
     fig.suptitle(title)
     fig.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
     fig.savefig(os.path.join(outdir, filename))
     plt.close(fig)
 
@@ -583,6 +622,7 @@ def plot_client_latency_curves(rates, ttft_p50, ttft_p95, e2e_p50, e2e_p95, outd
     ax1.legend()
     fig1.suptitle("Client TTFT vs Request Rate")
     fig1.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
     fig1.savefig(os.path.join(outdir, "client_latency_ttft.png"))
     plt.close(fig1)
 
@@ -595,6 +635,6 @@ def plot_client_latency_curves(rates, ttft_p50, ttft_p95, e2e_p50, e2e_p95, outd
     ax2.legend()
     fig2.suptitle("Client E2E Latency vs Request Rate")
     fig2.tight_layout()
+    os.makedirs(outdir, exist_ok=True)
     fig2.savefig(os.path.join(outdir, "client_latency_e2e.png"))
     plt.close(fig2)
-
