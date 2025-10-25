@@ -331,4 +331,3 @@ async def poll_queue_metrics(base_url: str, start_time: float, samples: List[Que
             await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
         except asyncio.TimeoutError:
             pass  # Continue polling
-

@@ -1,12 +1,14 @@
 """
 Main benchmark orchestration script.
 
-Usage:
-python main.py --url http://localhost:30000/v1/chat/completions --num-requests 100 --model moondream/moondream3-preview
+Usage for vision models (moondream):
+python main.py --url http://localhost:30000/v1/chat/completions --num-requests 100 --model moondream/moondream3-preview --model-type vision
 
-or for multi-rate benchmarks:
+Usage for text models (llama):
+python main.py --url http://localhost:30000/v1/chat/completions --num-requests 100 --model meta-llama/Llama-3-8B --model-type text
 
-python main.py --url http://localhost:3000/v1/chat/completions --model moondream/moondream3-preview --num-requests 100 --run-multi --rates "1,10,100" --output-dir ./out
+For multi-rate benchmarks:
+python main.py --url http://localhost:3000/v1/chat/completions --model meta-llama/Llama-3-8B --model-type text --num-requests 100 --run-multi --rates "1,10,100" --output-dir ./out
 """
 
 import argparse
@@ -26,6 +28,7 @@ from client_metrics import (
     calculate_metrics,
     generate_requests,
     load_coco_dataset,
+    load_text_dataset,
     send_chat_request,
 )
 from server_metrics import (
@@ -59,8 +62,15 @@ async def run_single_benchmark(args, request_rate: float):
         else:
             print("⚠ Could not fetch server metrics - will show client POV only")
 
-    # Load dataset
-    requests = load_coco_dataset(args.num_requests, random_sample=True)
+    # Load dataset based on model type
+    model_type = getattr(args, 'model_type', 'vision')  # Default to vision for backward compatibility
+    if model_type == 'text':
+        print("Loading text dataset for text-only model...")
+        requests = load_text_dataset(args.num_requests, random_sample=True)
+    else:
+        print("Loading COCO vision dataset for vision model...")
+        requests = load_coco_dataset(args.num_requests, random_sample=True)
+
     if not requests:
         raise ValueError("No requests loaded from dataset")
 
@@ -114,6 +124,12 @@ async def run_single_benchmark(args, request_rate: float):
                 "p95": client_metrics.e2e_p95_ms,
                 "p99": client_metrics.e2e_p99_ms,
                 "avg": client_metrics.e2e_avg_ms,
+            },
+            "itl_ms": {
+                "p50": client_metrics.itl_p50_ms,
+                "p95": client_metrics.itl_p95_ms,
+                "p99": client_metrics.itl_p99_ms,
+                "avg": client_metrics.itl_avg_ms,
             },
             "toks": {
                 "p50": client_metrics.toks_p50,
@@ -218,9 +234,11 @@ def parse_rates(rates_str: Optional[str]) -> List[float]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Client-side benchmark for vision-language models")
+    parser = argparse.ArgumentParser(description="Client-side benchmark for language models (vision and text)")
     parser.add_argument("--url", type=str, required=True, help="API endpoint URL (e.g., http://localhost:30000/v1/chat/completions)")
     parser.add_argument("--model", type=str, default="default", help="Model name to use in requests")
+    parser.add_argument("--model-type", type=str, choices=["vision", "text"], default="vision",
+                        help="Model type: 'vision' for vision-language models (e.g., moondream) or 'text' for text-only models (e.g., llama)")
     parser.add_argument("--num-requests", type=int, default=100, help="Number of requests to send")
     parser.add_argument("--request-rate", type=float, default=float("inf"), help="Request rate (req/s) for single-run mode")
     parser.add_argument("--rates", type=str, help="Comma-separated request rates for multi-run (e.g., '1,10,100'). Defaults to 1,10,100 if provided without value.")
@@ -252,4 +270,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -28,6 +28,7 @@ def print_metrics(client_metrics: BenchmarkMetrics, server_metrics: Optional[Dic
     print("CLIENT POV:")
     print(f"{'  TTFT (ms)':<30} {client_metrics.ttft_p50_ms:>15.2f} {client_metrics.ttft_p95_ms:>15.2f} {client_metrics.ttft_p99_ms:>15.2f} {client_metrics.ttft_avg_ms:>15.2f}")
     print(f"{'  E2E Latency (ms)':<30} {client_metrics.e2e_p50_ms:>15.2f} {client_metrics.e2e_p95_ms:>15.2f} {client_metrics.e2e_p99_ms:>15.2f} {client_metrics.e2e_avg_ms:>15.2f}")
+    print(f"{'  ITL (ms)':<30} {client_metrics.itl_p50_ms:>15.2f} {client_metrics.itl_p95_ms:>15.2f} {client_metrics.itl_p99_ms:>15.2f} {client_metrics.itl_avg_ms:>15.2f}")
     print(f"{'  Tok/s':<30} {client_metrics.toks_p50:>15.2f} {client_metrics.toks_p95:>15.2f} {client_metrics.toks_p99:>15.2f} {client_metrics.toks_avg:>15.2f}")
 
     if server_metrics is None:
@@ -277,7 +278,7 @@ def convert_cumulative_to_bucket_counts(cumulative_buckets: Dict[float, float]) 
 
 
 def plot_distribution_skewness(outputs: List[RequestOutput], outdir: str, rate_suffix: str = ""):
-    """Plot histograms showing distribution skewness for TTFT, E2E latency, and tok/s."""
+    """Plot histograms showing distribution skewness for TTFT, E2E latency, ITL, and tok/s."""
     successful = [o for o in outputs if o.success]
     if not successful:
         print("⚠ No successful requests to plot distribution")
@@ -286,14 +287,16 @@ def plot_distribution_skewness(outputs: List[RequestOutput], outdir: str, rate_s
     # Extract metrics
     ttfts_ms = [o.ttft * 1000 for o in successful if o.ttft > 0]
     e2e_latencies_ms = [o.e2e_latency * 1000 for o in successful]
+    itls_ms = [latency * 1000 for o in successful for latency in o.itl]
     toks_per_sec = [o.output_tokens / o.e2e_latency for o in successful if o.e2e_latency > 0 and o.output_tokens > 0]
 
-    # Create figure with 3 subplots
-    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+    # Create figure with 4 subplots
+    fig, axes = plt.subplots(4, 1, figsize=(10, 16))
 
     metrics_data = [
         (ttfts_ms, "TTFT (ms)", "TTFT Distribution"),
         (e2e_latencies_ms, "E2E Latency (ms)", "E2E Latency Distribution"),
+        (itls_ms, "ITL (ms)", "ITL Distribution"),
         (toks_per_sec, "Tok/s", "Tok/s Distribution"),
     ]
 

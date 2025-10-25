@@ -21,10 +21,10 @@ from tqdm.asyncio import tqdm
 class RequestInput:
     """Input data for a single request."""
     prompt: str
-    image_url: str
+    image_url: Optional[str]  # None for text-only models like llama
     request_id: int
     prompt_length: int  # Length of text prompt in characters
-    image_size_bytes: int  # Size of image in bytes
+    image_size_bytes: int = 0  # Size of image in bytes (0 for text-only)
 
 
 @dataclass
@@ -60,6 +60,12 @@ class BenchmarkMetrics:
     toks_p95: float
     toks_p99: float
     toks_avg: float
+
+    # ITL (inter-token latency) metrics (ms)
+    itl_p50_ms: float
+    itl_p95_ms: float
+    itl_p99_ms: float
+    itl_avg_ms: float
 
 
 # --- Moondream Starmie tokenizer integration ---
@@ -171,6 +177,87 @@ def load_coco_dataset(num_samples: int, random_sample: bool = True) -> List[Requ
     return requests
 
 
+def load_text_dataset(num_samples: int, random_sample: bool = True) -> List[RequestInput]:
+    """Load text dataset for text-only models like llama."""
+    try:
+        from datasets import load_dataset
+        import random
+    except ImportError:
+        raise ImportError("Please install datasets: pip install datasets")
+
+    print("Loading text dataset from HuggingFace...")
+
+    # Try to load ShareGPT dataset, fallback to synthetic prompts if unavailable
+    try:
+        dataset = load_dataset("anon8231489123/ShareGPT_Vicuna_unfiltered", split="train")
+        print(f"Loaded {len(dataset)} conversations from ShareGPT dataset")
+
+        if len(dataset) > num_samples:
+            if random_sample:
+                indices = random.sample(range(len(dataset)), num_samples)
+                sampled_dataset = dataset.select(indices)
+            else:
+                sampled_dataset = dataset.select(range(num_samples))
+        else:
+            print(f"Dataset has fewer than {num_samples} samples, using all {len(dataset)}")
+            sampled_dataset = dataset
+
+        requests = []
+        for idx, example in enumerate(sampled_dataset):
+            conversations = example.get("conversations", [])
+            if not conversations:
+                continue
+            # Get the first user message
+            user_msg = next((c["value"] for c in conversations if c.get("from") == "human"), None)
+            if user_msg:
+                requests.append(RequestInput(
+                    prompt=user_msg,
+                    image_url=None,
+                    request_id=idx,
+                    prompt_length=len(user_msg),
+                    image_size_bytes=0
+                ))
+    except Exception as e:
+        print(f"Could not load ShareGPT dataset ({e}), using synthetic prompts instead")
+        # Fallback: Generate synthetic prompts
+        prompts = [
+            "Explain the concept of quantum computing in simple terms.",
+            "Write a short story about a robot learning to feel emotions.",
+            "What are the main differences between Python and JavaScript?",
+            "Describe the process of photosynthesis step by step.",
+            "What are some effective strategies for time management?",
+            "Explain how blockchain technology works.",
+            "What are the health benefits of regular exercise?",
+            "Describe the water cycle and its importance.",
+            "What are the key principles of object-oriented programming?",
+            "Explain the theory of relativity in layman's terms.",
+            "What are the main causes of climate change?",
+            "Describe the process of making bread from scratch.",
+            "What are the differences between renewable and non-renewable energy?",
+            "Explain how neural networks learn from data.",
+            "What are the fundamental principles of economics?",
+            "Describe the structure and function of DNA.",
+            "What are the key differences between democracy and authoritarianism?",
+            "Explain how vaccines work to protect against diseases.",
+            "What are the main features of Gothic architecture?",
+            "Describe the process of how movies are made from script to screen.",
+        ]
+
+        requests = []
+        for idx in range(num_samples):
+            prompt = prompts[idx % len(prompts)]
+            requests.append(RequestInput(
+                prompt=prompt,
+                image_url=None,
+                request_id=idx,
+                prompt_length=len(prompt),
+                image_size_bytes=0
+            ))
+
+    print(f"Created {len(requests)} text-only requests")
+    return requests
+
+
 def print_no_success_failure_messages(outputs: List[RequestOutput]) -> None:
     """Print aggregated failure reasons when no requests succeeded."""
     failures = [o for o in outputs if not o.success]
@@ -208,12 +295,22 @@ async def send_chat_request(
 ) -> RequestOutput:
     """Send a single chat completion request and collect client-side metrics."""
     output = RequestOutput(request_id=request_input.request_id)
-    messages = [
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": request_input.image_url}},
-            {"type": "text", "text": request_input.prompt}
-        ]}
-    ]
+
+    # Build messages based on whether this is a vision or text-only request
+    if request_input.image_url:
+        # Vision model request (e.g., moondream)
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": request_input.image_url}},
+                {"type": "text", "text": request_input.prompt}
+            ]}
+        ]
+    else:
+        # Text-only model request (e.g., llama)
+        messages = [
+            {"role": "user", "content": request_input.prompt}
+        ]
+
     payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.0, "stream": True}
 
     # Add Authorization header if API key is provided
@@ -291,6 +388,8 @@ def calculate_metrics(outputs: List[RequestOutput], duration_s: float) -> Benchm
     ttfts = [o.ttft for o in successful if o.ttft > 0]
     e2e_latencies = [o.e2e_latency for o in successful]
     toks_per_sec = [o.output_tokens / o.e2e_latency for o in successful if o.e2e_latency > 0 and o.output_tokens > 0]
+    # Flatten all inter-token latencies from all requests
+    all_itls = [latency for o in successful for latency in o.itl]
 
     return BenchmarkMetrics(
         ttft_p50_ms=float(np.percentile(ttfts, 50) * 1000) if ttfts else 0,
@@ -305,5 +404,8 @@ def calculate_metrics(outputs: List[RequestOutput], duration_s: float) -> Benchm
         toks_p95=float(np.percentile(toks_per_sec, 95)) if toks_per_sec else 0,
         toks_p99=float(np.percentile(toks_per_sec, 99)) if toks_per_sec else 0,
         toks_avg=float(np.mean(toks_per_sec)) if toks_per_sec else 0,
+        itl_p50_ms=float(np.percentile(all_itls, 50) * 1000) if all_itls else 0,
+        itl_p95_ms=float(np.percentile(all_itls, 95) * 1000) if all_itls else 0,
+        itl_p99_ms=float(np.percentile(all_itls, 99) * 1000) if all_itls else 0,
+        itl_avg_ms=float(np.mean(all_itls) * 1000) if all_itls else 0,
     )
-
