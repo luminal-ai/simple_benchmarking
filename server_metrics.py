@@ -217,12 +217,12 @@ async def fetch_server_metrics(base_url: str, backend: str = "luminal") -> Optio
                         
                         avg_batch_size=parsed.get('vllm:num_requests_running', 0.0),
                         num_queue_reqs=int(parsed.get('vllm:num_requests_waiting', 0)),
-                        avg_request_queue_latency=0.0,
+                        avg_request_queue_latency=parsed.get('vllm:request_queue_time_seconds_sum', 0.0) / max(parsed.get('vllm:request_queue_time_seconds_count', 1), 1),
                         
-                        queue_length_buckets={},
-                        queue_latency_buckets={},
-                        queue_length_sum=0.0,
-                        queue_latency_sum=0.0,
+                        queue_length_buckets=histograms.get('vllm:num_requests_waiting', {}),
+                        queue_latency_buckets=histograms.get('vllm:request_queue_time_seconds', {}),
+                        queue_length_sum=parsed.get('vllm:num_requests_waiting_sum', 0.0),
+                        queue_latency_sum=parsed.get('vllm:request_queue_time_seconds_sum', 0.0),
                     )
                 else:
                     server_metrics = ServerMetrics(
