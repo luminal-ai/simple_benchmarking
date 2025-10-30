@@ -224,6 +224,8 @@ async def fetch_server_metrics(base_url: str, backend: str = "luminal") -> Optio
                         queue_length_sum=parsed.get('vllm:num_requests_waiting_sum', 0.0),
                         queue_latency_sum=parsed.get('vllm:request_queue_time_seconds_sum', 0.0),
                     )
+                elif backend == "sglang":
+                    pass
                 else:
                     server_metrics = ServerMetrics(
                         num_requests=int(parsed.get('luminal:num_requests_total', 0)),
@@ -362,7 +364,12 @@ def calculate_server_metrics_delta(before: ServerMetrics, after: ServerMetrics, 
 async def poll_queue_metrics(base_url: str, start_time: float, samples: List[QueueMetricsSample],
                              poll_interval: float = 5.0, stop_event: asyncio.Event = None, backend: str = "luminal"):
     """Background task that polls queue metrics periodically."""
-    metric_prefix = "vllm:" if backend == "vllm" else "luminal:"
+    if backend == "vllm":
+        metric_prefix = "vllm:"
+    elif backend == "sglang":
+        metric_prefix = "sglang:"
+    else:
+        metric_prefix = "luminal:"
     
     while not stop_event.is_set():
         try:
@@ -381,6 +388,8 @@ async def poll_queue_metrics(base_url: str, start_time: float, samples: List[Que
                                 num_running_reqs=int(parsed.get('vllm:num_requests_running', 0)),
                                 token_usage=parsed.get('vllm:gpu_cache_usage_perc', 0.0),
                             )
+                        elif backend == "sglang":
+                            pass
                         else:
                             sample = QueueMetricsSample(
                                 timestamp=time.perf_counter() - start_time,
