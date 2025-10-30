@@ -224,6 +224,25 @@ async def fetch_server_metrics(base_url: str, backend: str = "luminal") -> Optio
                         queue_length_sum=parsed.get('vllm:num_requests_waiting_sum', 0.0),
                         queue_latency_sum=parsed.get('vllm:request_queue_time_seconds_sum', 0.0),
                     )
+                elif backend == "sglang":
+                    server_metrics = ServerMetrics(
+                        num_requests=int(parsed.get('sglang:num_requests_total', 0)),
+                        num_aborted_requests=0, #Could not find matching metric
+                        prompt_tokens=int(parsed.get('sglang:prompt_tokens_total', 0)),
+                        generation_tokens=int(parsed.get('sglang:generation_tokens_total', 0)),
+                        cached_tokens=int(parsed.get('sglang:cached_tokens_total', 0)),
+                        prefill_throughput_buckets=histograms.get('sglang:time_to_first_token_seconds', {}),
+                        decode_throughput_buckets={}, #Could not find matching metric
+                        prefill_throughput_sum=parsed.get('sglang:time_to_first_token_seconds_sum', 0.0),
+                        decode_throughput_sum=0.0, #Could not find matching metric
+                        avg_batch_size=parsed.get('sglang:num_running_reqs', 0.0),
+                        num_queue_reqs=int(parsed.get('sglang:num_queue_reqs', 0)),
+                        avg_request_queue_latency=parsed.get('sglang:queue_time_seconds_sum', 0.0) / max(parsed.get('sglang:queue_time_seconds_count', 1), 1),
+                        queue_length_buckets={}, #Could not find matching metric
+                        queue_latency_buckets=histograms.get('sglang:queue_time_seconds', {}),
+                        queue_length_sum=0.0, #Could not find matching metric
+                        queue_latency_sum=parsed.get('sglang:queue_time_seconds_sum', 0.0),
+                    )
                 else:
                     server_metrics = ServerMetrics(
                         num_requests=int(parsed.get('luminal:num_requests_total', 0)),
@@ -362,7 +381,12 @@ def calculate_server_metrics_delta(before: ServerMetrics, after: ServerMetrics, 
 async def poll_queue_metrics(base_url: str, start_time: float, samples: List[QueueMetricsSample],
                              poll_interval: float = 5.0, stop_event: asyncio.Event = None, backend: str = "luminal"):
     """Background task that polls queue metrics periodically."""
-    metric_prefix = "vllm:" if backend == "vllm" else "luminal:"
+    if backend == "vllm":
+        metric_prefix = "vllm:"
+    elif backend == "sglang":
+        metric_prefix = "sglang:"
+    else:
+        metric_prefix = "luminal:"
     
     while not stop_event.is_set():
         try:
@@ -371,7 +395,7 @@ async def poll_queue_metrics(base_url: str, start_time: float, samples: List[Que
                 async with session.get(metrics_url, timeout=aiohttp.ClientTimeout(total=5)) as response:
                     if response.status == 200:
                         text = await response.text()
-                        parsed, _ = parse_prometheus_metrics(text)
+                        parsed, _, _= parse_prometheus_metrics(text)
 
                         if backend == "vllm":
                             sample = QueueMetricsSample(
@@ -380,6 +404,14 @@ async def poll_queue_metrics(base_url: str, start_time: float, samples: List[Que
                                 avg_queue_latency=0.0,
                                 num_running_reqs=int(parsed.get('vllm:num_requests_running', 0)),
                                 token_usage=parsed.get('vllm:gpu_cache_usage_perc', 0.0),
+                            )
+                        elif backend == "sglang":
+                            sample = QueueMetricsSample(
+                                timestamp=time.perf_counter() - start_time,
+                                num_queue_reqs=int(parsed.get('sglang:num_queue_reqs', 0)),
+                                avg_queue_latency=0.0,
+                                num_running_reqs=int(parsed.get('sglang:num_running_reqs', 0)),
+                                token_usage=parsed.get('sglang:token_usage', 0.0),
                             )
                         else:
                             sample = QueueMetricsSample(
