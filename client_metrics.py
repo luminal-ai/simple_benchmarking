@@ -38,6 +38,8 @@ class RequestOutput:
     e2e_latency: float = 0.0  # End-to-end latency (seconds)
     output_tokens: int = 0
     itl: List[float] = field(default_factory=list)  # Inter-token latencies
+    prompt_tokens: int = 0  # Prompt tokens including image tokens
+    completion_tokens: int = 0  # Completion tokens from usage
 
 
 @dataclass
@@ -311,7 +313,16 @@ async def send_chat_request(
             {"role": "user", "content": request_input.prompt}
         ]
 
-    payload = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.0, "stream": True}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {
+            "include_usage": True
+        }
+    }
 
     # Add Authorization header if API key is provided
     headers = {}
@@ -343,7 +354,19 @@ async def send_chat_request(
                     data = json.loads(chunk_str)
                 except json.JSONDecodeError:
                     continue
-                delta = data.get("choices", [{}])[0].get("delta", {})
+
+                # Check for usage information
+                usage = data.get("usage")
+                if usage:
+                    output.prompt_tokens = usage.get("prompt_tokens", 0)
+                    output.completion_tokens = usage.get("completion_tokens", 0)
+
+                # Check if choices array has elements before accessing
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+
+                delta = choices[0].get("delta", {})
                 content = delta.get("content", "")
                 if content:
                     timestamp = time.perf_counter()
@@ -357,6 +380,9 @@ async def send_chat_request(
 
             output.e2e_latency = time.perf_counter() - start_time
             output.generated_text = generated_text
+            # Use completion_tokens from API if available, otherwise use counted tokens
+            if output.completion_tokens > 0:
+                output.output_tokens = output.completion_tokens
             output.success = True
 
     except Exception as e:
@@ -387,7 +413,12 @@ def calculate_metrics(outputs: List[RequestOutput], duration_s: float) -> Benchm
 
     ttfts = [o.ttft for o in successful if o.ttft > 0]
     e2e_latencies = [o.e2e_latency for o in successful]
-    toks_per_sec = [o.output_tokens / o.e2e_latency for o in successful if o.e2e_latency > 0 and o.output_tokens > 0]
+    # Use total tokens (prompt + completion) from API usage for accurate tok/s including image tokens
+    toks_per_sec = [
+        (o.prompt_tokens + o.completion_tokens) / o.e2e_latency
+        for o in successful
+        if o.e2e_latency > 0 and (o.prompt_tokens + o.completion_tokens) > 0
+    ]
     # Flatten all inter-token latencies from all requests
     all_itls = [latency for o in successful for latency in o.itl]
 
