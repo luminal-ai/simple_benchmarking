@@ -29,6 +29,7 @@ from client_metrics import (
     generate_requests,
     load_coco_dataset,
     load_text_dataset,
+    load_text_dataset_with_length,
     send_chat_request,
 )
 from server_metrics import (
@@ -46,9 +47,10 @@ from metrics_printer import (
     print_metrics,
     print_prefill_decode_tables,
 )
+from convert_results import convert
 
 
-async def run_single_benchmark(args, request_rate: float):
+async def run_single_benchmark(args, request_rate: float, preloaded_requests: Optional[List[RequestInput]] = None):
     """Runs one benchmark at a given request_rate and returns a result dict."""
     print(f"\n=== Running benchmark at {request_rate} req/s ===")
     base_url = args.url.rsplit('/v1/', 1)[0] if '/v1/' in args.url else args.url.rsplit('/', 1)[0]
@@ -62,14 +64,17 @@ async def run_single_benchmark(args, request_rate: float):
         else:
             print("⚠ Could not fetch server metrics - will show client POV only")
 
-    # Load dataset based on model type
-    model_type = getattr(args, 'model_type', 'vision')  # Default to vision for backward compatibility
-    if model_type == 'text':
-        print("Loading text dataset for text-only model...")
-        requests = load_text_dataset(args.num_requests, random_sample=True)
+    # Use preloaded requests if provided, otherwise load dataset
+    if preloaded_requests is not None:
+        requests = preloaded_requests
     else:
-        print("Loading COCO vision dataset for vision model...")
-        requests = load_coco_dataset(args.num_requests, random_sample=True)
+        model_type = getattr(args, 'model_type', 'vision')
+        if model_type == 'text':
+            print("Loading text dataset for text-only model...")
+            requests = load_text_dataset(args.num_requests, random_sample=True)
+        else:
+            print("Loading COCO vision dataset for vision model...")
+            requests = load_coco_dataset(args.num_requests, random_sample=True)
 
     if not requests:
         raise ValueError("No requests loaded from dataset")
@@ -109,9 +114,25 @@ async def run_single_benchmark(args, request_rate: float):
     if server_metrics_before and server_metrics_after:
         plot_server_distribution_skewness(server_metrics_before, server_metrics_after, server_delta, outdir, rate_suffix)
 
+    # Compute per-request token averages for downstream report generation
+    successful = [o for o in outputs if o.success]
+    num_successful = len(successful)
+    avg_prompt_tokens = (
+        sum(o.prompt_tokens for o in successful) / num_successful
+        if num_successful else 0
+    )
+    avg_completion_tokens = (
+        sum(o.completion_tokens for o in successful) / num_successful
+        if num_successful else 0
+    )
+
     # Build a compact result bundle
     bundle = {
         "request_rate": request_rate,
+        "num_total": len(outputs),
+        "num_successful": num_successful,
+        "avg_prompt_tokens": avg_prompt_tokens,
+        "avg_completion_tokens": avg_completion_tokens,
         "client_metrics": {
             "ttft_ms": {
                 "p50": client_metrics.ttft_p50_ms,
@@ -155,11 +176,11 @@ def _save_json(path: str, data):
     print(f"Saved {path}")
 
 
-async def run_multi_rate_benchmark(args, rates: List[float]) -> List[dict]:
+async def run_multi_rate_benchmark(args, rates: List[float], preloaded_requests: Optional[List[RequestInput]] = None) -> List[dict]:
     """Runs benchmarks across multiple request rates and returns list of result bundles."""
     results = []
     for idx, r in enumerate(rates):
-        bundle = await run_single_benchmark(args, r)
+        bundle = await run_single_benchmark(args, r, preloaded_requests)
         results.append(bundle)
 
         # Wait between tests unless this was the last one
@@ -172,7 +193,7 @@ async def run_multi_rate_benchmark(args, rates: List[float]) -> List[dict]:
     return results
 
 
-def build_and_plot(results: List[dict], outdir: str):
+def build_and_plot(results: List[dict], outdir: str, args):
     """Extracts series from results and generates plots + summary JSON."""
     _ensure_outdir(outdir)
 
@@ -202,8 +223,109 @@ def build_and_plot(results: List[dict], outdir: str):
 
     plot_client_latency_curves(rates, ttft_p50_ms, ttft_p95_ms, e2e_p50_ms, e2e_p95_ms, outdir)
 
-    # Save summary JSON
-    _save_json(os.path.join(outdir, "benchmark_summary.json"), {"results": results})
+    # Save summary JSON with metadata for report generation
+    summary = {
+        "url": args.url,
+        "model": args.model,
+        "model_type": getattr(args, 'model_type', 'text'),
+        "num_requests": args.num_requests,
+        "max_tokens": args.max_tokens,
+        "rates": rates,
+        "results": results,
+    }
+    _save_json(os.path.join(outdir, "benchmark_summary.json"), summary)
+
+    # Auto-generate report_data.json and HTML report
+    _generate_report(summary, outdir, args)
+
+
+async def run_multi_scenario_benchmark(args, rates: List[float], input_lengths: List[int]):
+    """Run benchmarks across multiple input lengths and request rates.
+
+    Produces a multi-scenario benchmark_summary.json and generates the HTML report
+    with context-length variation on the x-axis.
+    """
+    _ensure_outdir(args.output_dir)
+    all_scenarios = []
+
+    for il_idx, input_len in enumerate(input_lengths):
+        il_label = f"{input_len // 1024}k" if input_len >= 1024 else str(input_len)
+        print(f"\n{'='*60}")
+        print(f"  Scenario {il_idx+1}/{len(input_lengths)}: input_length={input_len} tokens ({il_label})")
+        print(f"{'='*60}")
+
+        # Pre-generate requests at this input length
+        requests = load_text_dataset_with_length(args.num_requests, input_len, random_sample=True)
+
+        # Run all rates for this input length
+        results = await run_multi_rate_benchmark(args, rates, preloaded_requests=requests)
+
+        all_scenarios.append({
+            "input_length": input_len,
+            "rates": rates,
+            "results": results,
+        })
+
+        # Print per-scenario tables
+        print_prefill_decode_tables(results, args.num_requests)
+
+        # Cool down between scenarios
+        if il_idx < len(input_lengths) - 1:
+            wait_s = max(0, int(args.inter_run_wait_seconds))
+            if wait_s > 0:
+                print(f"\nCooling down {wait_s}s before next input length...")
+                await asyncio.sleep(wait_s)
+
+    # Save multi-scenario summary
+    summary = {
+        "url": args.url,
+        "model": args.model,
+        "model_type": getattr(args, 'model_type', 'text'),
+        "num_requests": args.num_requests,
+        "max_tokens": args.max_tokens,
+        "input_lengths": input_lengths,
+        "rates": rates,
+        "scenarios": all_scenarios,
+    }
+    _save_json(os.path.join(args.output_dir, "benchmark_summary.json"), summary)
+
+    # Generate report
+    _generate_report(summary, args.output_dir, args)
+
+
+def _generate_report(summary: dict, outdir: str, args):
+    """Convert benchmark results and generate HTML report."""
+    try:
+        report_data = convert(
+            summary,
+            provider_name=getattr(args, 'provider', None),
+            gpu_name=getattr(args, 'gpu', None),
+        )
+        report_json_path = os.path.join(outdir, "report_data.json")
+        _save_json(report_json_path, report_data)
+
+        # Generate HTML report
+        from generate_report import load_report_json, build_scenario_data, generate_html_report
+        from generate_report import fig_throughput_tradeoff, fig_system_throughput, fig_per_user_speed
+        from generate_report import fig_scaling_efficiency, fig_latency
+
+        df, model_name, gpu_name = load_report_json(report_json_path)
+        sd = build_scenario_data(df)
+
+        report_dir = os.path.join(outdir, "report")
+        os.makedirs(report_dir, exist_ok=True)
+
+        fig_throughput_tradeoff(df, model_name, report_dir)
+        fig_system_throughput(df, model_name, report_dir)
+        fig_per_user_speed(df, model_name, report_dir)
+        fig_scaling_efficiency(df, model_name, report_dir)
+        fig_latency(df, model_name, report_dir)
+        generate_html_report(df, model_name, gpu_name, sd, report_dir)
+        print(f"\nHTML report: {os.path.join(report_dir, 'index.html')}")
+    except Exception as e:
+        print(f"\nWARNING: Report generation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 async def run_benchmark(args):
@@ -249,6 +371,11 @@ def main():
     parser.add_argument("--api-key", type=str, help="Optional API key for authentication")
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar")
     parser.add_argument("--disable-server-metrics", action="store_true", help="Disable fetching server-side Prometheus metrics")
+    parser.add_argument("--provider", type=str, help="Provider name for report (e.g., 'Together AI')")
+    parser.add_argument("--gpu", type=str, help="GPU/hardware name for report (e.g., '8xH100')")
+    parser.add_argument("--input-lengths", type=str,
+                        help="Comma-separated input token lengths to sweep (e.g., '512,2048,8192,32768'). "
+                             "Generates separate scenarios per context length for the HTML report.")
 
     parser.add_argument(
         "--inter-run-wait-seconds",
@@ -261,9 +388,16 @@ def main():
 
     if args.run_multi:
         rates = parse_rates(args.rates) if args.rates else [1.0, 10.0, 100.0]
-        results = asyncio.run(run_multi_rate_benchmark(args, rates))
-        build_and_plot(results, args.output_dir)
-        print_prefill_decode_tables(results, args.num_requests)
+
+        if args.input_lengths:
+            # Multi-scenario sweep: vary both input length and request rate
+            input_lengths = [int(x.strip()) for x in args.input_lengths.split(",")]
+            asyncio.run(run_multi_scenario_benchmark(args, rates, input_lengths))
+        else:
+            # Single scenario, multiple rates (original behavior)
+            results = asyncio.run(run_multi_rate_benchmark(args, rates))
+            build_and_plot(results, args.output_dir, args)
+            print_prefill_decode_tables(results, args.num_requests)
     else:
         asyncio.run(run_benchmark(args))
 

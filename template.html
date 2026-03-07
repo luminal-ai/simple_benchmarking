@@ -1,0 +1,1021 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>{{PAGE_TITLE}}</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link
+            href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+            rel="stylesheet"
+        />
+        <style>
+            :root {
+                /* Luminal-ish dark system */
+                --bg: #060b0a;
+                --bg-elev: rgba(255, 255, 255, 0.03);
+                --bg-elev-2: rgba(255, 255, 255, 0.05);
+                --grid: rgba(255, 255, 255, 0.04);
+
+                --border: rgba(255, 255, 255, 0.08);
+                --border-strong: rgba(255, 255, 255, 0.12);
+
+                --text-primary: rgba(255, 255, 255, 0.92);
+                --text-secondary: rgba(255, 255, 255, 0.72);
+                --text-muted: rgba(255, 255, 255, 0.55);
+
+                /* Accent */
+                --accent: #34d399; /* emerald */
+                --accent-2: #22c55e; /* slightly greener */
+                --accent-soft: rgba(52, 211, 153, 0.12);
+                --accent-border: rgba(52, 211, 153, 0.22);
+
+                /* “Metric colors” mapped to dark theme */
+                --blue: var(--accent);
+                --green: var(--accent);
+                --orange: #f59e0b;
+                --yellow: #eab308;
+                --purple: #a78bfa;
+                --cyan: #22d3ee;
+                --red: #fb7185;
+
+                --shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+            }
+
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            html,
+            body {
+                height: 100%;
+            }
+
+            body {
+                color: var(--text-primary);
+                font-family:
+                    "Inter",
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    "Segoe UI",
+                    Helvetica,
+                    Arial,
+                    sans-serif;
+                line-height: 1.6;
+
+                /* Dark base + subtle “Luminal” glow + grid */
+                background:
+                    radial-gradient(
+                        900px 500px at 70% 25%,
+                        rgba(52, 211, 153, 0.12),
+                        transparent 60%
+                    ),
+                    radial-gradient(
+                        700px 420px at 25% 20%,
+                        rgba(255, 255, 255, 0.06),
+                        transparent 65%
+                    ),
+                    linear-gradient(
+                        180deg,
+                        #040707 0%,
+                        #060b0a 55%,
+                        #040707 100%
+                    );
+                position: relative;
+                overflow-x: hidden;
+            }
+
+            /* Subtle grid overlay */
+            body:before {
+                content: "";
+                position: fixed;
+                inset: 0;
+                pointer-events: none;
+                background-image:
+                    linear-gradient(to right, var(--grid) 1px, transparent 1px),
+                    linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
+                background-size: 80px 80px;
+                opacity: 0.35;
+                mask-image: radial-gradient(
+                    900px 500px at 40% 15%,
+                    rgba(0, 0, 0, 1),
+                    rgba(0, 0, 0, 0)
+                );
+            }
+
+            .container {
+                max-width: 1180px;
+                margin: 0 auto;
+                padding: 0 24px;
+            }
+
+            /* Hairline separators */
+            .hero,
+            .specs-bar,
+            .section,
+            .glossary {
+                border-color: var(--border) !important;
+            }
+
+            /* HERO */
+            .hero {
+                padding: 92px 0 56px;
+                border-bottom: 1px solid var(--border);
+            }
+
+            .hero-badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                background: var(--accent-soft);
+                color: var(--accent);
+                border: 1px solid var(--accent-border);
+                padding: 6px 12px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: 600;
+                letter-spacing: 0.2px;
+                margin-bottom: 18px;
+            }
+
+            .hero h1 {
+                font-size: clamp(40px, 5vw, 64px);
+                font-weight: 700;
+                letter-spacing: -1.4px;
+                margin-bottom: 14px;
+                line-height: 1.05;
+            }
+
+            .hero h1 span {
+                color: var(--accent);
+                text-shadow: 0 0 20px rgba(52, 211, 153, 0.12);
+            }
+
+            .hero .subtitle {
+                font-size: 18px;
+                color: var(--text-secondary);
+                max-width: 820px;
+            }
+
+            /* SPECS BAR */
+            .specs-bar {
+                display: flex;
+                gap: 32px;
+                padding: 22px 0;
+                border-bottom: 1px solid var(--border);
+                flex-wrap: wrap;
+            }
+
+            .spec-label {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 1.2px;
+                color: var(--text-muted);
+                font-weight: 700;
+            }
+
+            .spec-value {
+                font-size: 14px;
+                font-weight: 600;
+                color: var(--text-primary);
+                font-family: "JetBrains Mono", monospace;
+            }
+
+            /* SECTION LABELS */
+            .section-label {
+                display: inline-block;
+                font-size: 12px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 1.8px;
+                color: var(--accent);
+                margin-bottom: 10px;
+            }
+
+            /* SECTIONS */
+            .section {
+                padding: 56px 0;
+                border-bottom: 1px solid var(--border);
+            }
+            .section:last-child {
+                border-bottom: none;
+            }
+
+            .section h2 {
+                font-size: 22px;
+                font-weight: 700;
+                letter-spacing: -0.5px;
+                margin-bottom: 10px;
+            }
+
+            .section .description {
+                color: var(--text-secondary);
+                font-size: 15px;
+                margin-bottom: 28px;
+                max-width: 780px;
+            }
+
+            /* CARD BASE (glass) */
+            .metric-card,
+            .chart-card,
+            .glossary-card {
+                background:
+                    radial-gradient(
+                        800px 240px at 50% 0%,
+                        rgba(255, 255, 255, 0.06),
+                        transparent 60%
+                    ),
+                    var(--bg-elev);
+                border: 1px solid var(--border);
+                border-radius: 18px;
+                box-shadow: var(--shadow);
+                backdrop-filter: blur(10px);
+            }
+
+            /* KEY METRICS */
+            .key-metrics {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 16px;
+                padding: 40px 0 12px;
+            }
+
+            .metric-card {
+                padding: 22px;
+                position: relative;
+                overflow: hidden;
+            }
+
+            /* subtle accent edge */
+            .metric-card:before {
+                content: "";
+                position: absolute;
+                inset: 0;
+                border-radius: 18px;
+                pointer-events: none;
+                background: linear-gradient(
+                    90deg,
+                    rgba(52, 211, 153, 0.22),
+                    transparent 45%,
+                    transparent 55%,
+                    rgba(52, 211, 153, 0.12)
+                );
+                opacity: 0.25;
+                mix-blend-mode: screen;
+            }
+
+            .metric-card .label {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 1.2px;
+                color: var(--text-muted);
+                margin-bottom: 6px;
+                font-weight: 700;
+            }
+
+            .metric-card .value {
+                font-size: 34px;
+                font-weight: 700;
+                letter-spacing: -1.2px;
+                font-family: "JetBrains Mono", monospace;
+                color: var(--text-primary);
+            }
+
+            .metric-card .unit {
+                font-size: 13px;
+                color: var(--text-muted);
+                font-weight: 500;
+            }
+
+            .metric-card .detail {
+                font-size: 13px;
+                color: var(--text-secondary);
+                margin-top: 6px;
+            }
+
+            /* Metric color helpers */
+            .metric-blue .value,
+            .metric-green .value {
+                color: var(--accent);
+            }
+
+            .metric-orange .value {
+                color: var(--orange);
+            }
+            .metric-purple .value {
+                color: var(--purple);
+            }
+            .metric-cyan .value {
+                color: var(--cyan);
+            }
+
+            /* CHARTS */
+            .chart-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 18px;
+            }
+
+            .chart-card {
+                padding: 26px;
+                border-radius: 18px;
+            }
+
+            .chart-card.full-width {
+                grid-column: 1 / -1;
+            }
+
+            .chart-card h3 {
+                font-size: 15px;
+                font-weight: 700;
+                margin-bottom: 6px;
+                letter-spacing: -0.2px;
+            }
+
+            .chart-card .chart-desc {
+                font-size: 13px;
+                color: var(--text-secondary);
+                margin-bottom: 14px;
+            }
+
+            .chart-caption {
+                font-style: italic;
+                font-size: 13px;
+                color: var(--text-muted);
+                text-align: center;
+                margin-top: 12px;
+                line-height: 1.5;
+            }
+
+            .chart-explainer {
+                margin-top: 12px;
+                padding: 12px 14px;
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                font-size: 13px;
+                color: var(--text-secondary);
+                line-height: 1.55;
+            }
+
+            /* TABLES (dark) */
+            .summary-table,
+            .data-table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+                margin-top: 18px;
+                overflow: hidden;
+                border-radius: 14px;
+                border: 1px solid var(--border);
+                background: rgba(0, 0, 0, 0.15);
+            }
+
+            .summary-table th,
+            .data-table th {
+                background: rgba(255, 255, 255, 0.04);
+                padding: 10px 14px;
+                text-align: right;
+                font-weight: 800;
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 1.2px;
+                color: var(--text-muted);
+                border-bottom: 1px solid var(--border);
+            }
+
+            .summary-table th:first-child,
+            .data-table th:first-child {
+                text-align: left;
+            }
+
+            .summary-table td,
+            .data-table td {
+                padding: 10px 14px;
+                text-align: right;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+                font-variant-numeric: tabular-nums;
+                font-family: "JetBrains Mono", monospace;
+                color: var(--text-secondary);
+            }
+
+            .summary-table td:first-child,
+            .data-table td:first-child {
+                text-align: left;
+                font-weight: 700;
+                font-family: "Inter", sans-serif;
+                color: var(--text-primary);
+            }
+
+            .summary-table tr:hover td,
+            .data-table tr:hover td {
+                background: rgba(52, 211, 153, 0.06);
+                color: var(--text-primary);
+            }
+
+            /* Threshold badges */
+            .threshold-legend {
+                display: flex;
+                gap: 14px;
+                margin-top: 12px;
+                flex-wrap: wrap;
+            }
+
+            .threshold-item {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 12px;
+                color: var(--text-muted);
+            }
+
+            .threshold-dot {
+                width: 14px;
+                height: 3px;
+                border-radius: 999px;
+                background: var(--accent);
+                opacity: 0.9;
+                box-shadow: 0 0 16px rgba(52, 211, 153, 0.18);
+            }
+
+            /* Narrative */
+            .narrative-prose {
+                max-width: 780px;
+                margin-top: 22px;
+                font-size: 15px;
+                line-height: 1.75;
+                color: var(--text-secondary);
+            }
+            .narrative-prose strong {
+                color: var(--text-primary);
+                font-weight: 700;
+            }
+
+            /* GLOSSARY */
+            .glossary {
+                padding: 26px 0 8px;
+                border-bottom: 1px solid var(--border);
+            }
+            .glossary-accordion {
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 0;
+            }
+            .glossary-summary {
+                cursor: pointer;
+                padding: 20px 24px;
+                list-style: none;
+            }
+            .glossary-summary::-webkit-details-marker { display: none; }
+            .glossary-summary::marker { display: none; content: ""; }
+            .glossary-summary::after {
+                content: "▸";
+                float: right;
+                font-size: 18px;
+                color: var(--text-muted);
+                transition: transform 0.2s;
+                margin-top: 4px;
+            }
+            details.glossary-accordion[open] > .glossary-summary::after {
+                transform: rotate(90deg);
+            }
+            details.glossary-accordion[open] > .glossary-grid,
+            details.glossary-accordion[open] > .chart-explainer {
+                padding: 0 24px;
+            }
+            details.glossary-accordion > .chart-explainer {
+                padding-bottom: 20px;
+            }
+
+            .glossary-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 14px;
+                margin-top: 16px;
+            }
+
+            .glossary-card {
+                padding: 16px;
+                border-radius: 16px;
+            }
+
+            .glossary-term code {
+                font-family: "JetBrains Mono", monospace;
+                font-size: 12px;
+                background: rgba(52, 211, 153, 0.1);
+                border: 1px solid rgba(52, 211, 153, 0.18);
+                padding: 4px 8px;
+                border-radius: 999px;
+                color: var(--text-primary);
+            }
+
+            .glossary-tag {
+                font-size: 11px;
+                font-weight: 800;
+                text-transform: uppercase;
+                letter-spacing: 1.1px;
+                color: var(--text-muted);
+            }
+
+            .glossary-body {
+                font-size: 13px;
+                color: var(--text-secondary);
+                line-height: 1.65;
+            }
+
+            /* FOOTER */
+            .footer {
+                padding: 44px 0;
+                text-align: center;
+                color: var(--text-muted);
+                font-size: 13px;
+            }
+            .footer a {
+                color: var(--accent);
+                text-decoration: none;
+            }
+            .footer a:hover {
+                text-decoration: underline;
+            }
+
+            /* Responsive */
+            @media (max-width: 900px) {
+                .chart-grid {
+                    grid-template-columns: 1fr;
+                }
+            }
+
+            @media (max-width: 768px) {
+                .hero {
+                    padding: 70px 0 46px;
+                }
+                .hero .subtitle {
+                    font-size: 16px;
+                }
+                .specs-bar {
+                    gap: 18px;
+                }
+                .key-metrics {
+                    grid-template-columns: 1fr 1fr;
+                }
+                .glossary-grid {
+                    grid-template-columns: 1fr;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <!-- Hero -->
+            <div class="hero">
+                <div class="hero-badge">Inference Benchmark</div>
+                <h1>
+                    <span>{{MODEL_NAME}}</span> on <span>{{GPU_NAME}}</span>
+                </h1>
+            </div>
+
+            <!-- Specs -->
+            <div class="specs-bar">{{SPECS_HTML}}</div>
+
+            <!-- Metric Glossary -->
+            <div class="glossary">
+                <details class="glossary-accordion">
+                    <summary class="glossary-summary">
+                        <div class="section-label" style="margin-bottom: 0">Definitions</div>
+                        <h2
+                            style="
+                                font-size: 22px;
+                                font-weight: 700;
+                                margin-bottom: 4px;
+                            "
+                        >
+                            Metric Glossary
+                        </h2>
+                        <p class="description" style="margin-bottom: 0">
+                            Quick definitions for the metrics used throughout this
+                            report. All timing metrics are measured on a live streaming
+                            endpoint.
+                        </p>
+                    </summary>
+
+                <div class="glossary-grid">
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>Context Length</code>
+                            <div class="glossary-tag">Input size</div>
+                        </div>
+                        <div class="glossary-body">
+                            The number of tokens provided as input (prompt +
+                            chat history). Longer context increases
+                            <em>prefill</em> cost and often increases
+                            <em>TTFT</em>.
+                        </div>
+                    </div>
+
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>Prefill</code>
+                            <div class="glossary-tag">Compute phase</div>
+                        </div>
+                        <div class="glossary-body">
+                            The “prompt processing” phase where the model
+                            ingests the full context and builds KV cache.
+                            Prefill cost scales roughly with
+                            <em>context length</em>.
+                        </div>
+                    </div>
+
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>Decode</code>
+                            <div class="glossary-tag">Compute phase</div>
+                        </div>
+                        <div class="glossary-body">
+                            The “generation” phase where the model produces new
+                            output tokens after the first token. Decode speed is
+                            usually reported as <em>tok/s</em>.
+                        </div>
+                    </div>
+
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>TTFT</code>
+                            <div class="glossary-tag">Latency</div>
+                        </div>
+                        <div class="glossary-body">
+                            <strong>Time To First Token</strong>: time from
+                            request start to the first streamed token. Dominated
+                            by prefill + scheduling/queueing overhead.
+                        </div>
+                    </div>
+
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>ITL</code>
+                            <div class="glossary-tag">Latency</div>
+                        </div>
+                        <div class="glossary-body">
+                            <strong>Inter-Token Latency</strong>: average time
+                            between successive streamed tokens during decode.
+                            Often shown in <em>ms/token</em>. Lower feels more
+                            “snappy”.
+                        </div>
+                    </div>
+
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>Decode Speed</code>
+                            <div class="glossary-tag">Throughput</div>
+                        </div>
+                        <div class="glossary-body">
+                            Output tokens per second. In this report:
+                            <strong>per-user</strong> = tokens/sec for one
+                            request stream, <strong>system</strong> = sum across
+                            all concurrent streams.
+                        </div>
+                    </div>
+
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>Per-User vs System</code>
+                            <div class="glossary-tag">Interpretation</div>
+                        </div>
+                        <div class="glossary-body">
+                            <strong>Per-user</strong> shows the experience of a
+                            single client (speed/latency).
+                            <strong>System total</strong> shows total server
+                            capacity across concurrent requests.
+                        </div>
+                    </div>
+
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>Scaling Efficiency</code>
+                            <div class="glossary-tag">Concurrency</div>
+                        </div>
+                        <div class="glossary-body">
+                            How close the system is to “perfect scaling” as
+                            concurrency increases:
+                            <em
+                                >system_throughput / (bs1_throughput ×
+                                batch_size)</em
+                            >. 100% = no loss; lower means contention/scheduling
+                            overhead.
+                        </div>
+                    </div>
+
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>E2E Latency</code>
+                            <div class="glossary-tag">Latency</div>
+                        </div>
+                        <div class="glossary-body">
+                            End-to-end time for the request to finish streaming:
+                            <em>TTFT + decode_time</em>. This is what a user
+                            feels for “full completion time”.
+                        </div>
+                    </div>
+
+                    <div class="glossary-card">
+                        <div class="glossary-term">
+                            <code>Batch Size / Concurrency</code>
+                            <div class="glossary-tag">Load</div>
+                        </div>
+                        <div class="glossary-body">
+                            Number of concurrent requests in flight (your report
+                            uses “batch size” to mean concurrency). Higher
+                            concurrency typically improves system tok/s but
+                            reduces per-user tok/s.
+                        </div>
+                    </div>
+                </div>
+
+                <div class=”chart-explainer” style=”margin-top: 16px”>
+                    <strong>Rule of thumb:</strong> TTFT is mostly about
+                    <em>prefill + queueing</em>; ITL is mostly about
+                    <em>decode smoothness</em>. “Per-user” metrics reflect UX;
+                    “system” metrics reflect capacity.
+                </div>
+                </details>
+            </div>
+
+            <!-- Key Metrics -->
+            <div class="key-metrics">{{KEY_METRICS_HTML}}</div>
+
+            <!-- Section: Performance Charts -->
+            <div class="section">
+                <div class="section-label">Performance</div>
+                <h2>Performance Charts</h2>
+                <p class="description">
+                    Performance across context lengths at different concurrency
+                    levels. The top edge of each band shows single-user
+                    performance; the bottom edge shows performance at maximum
+                    tested concurrency.
+                </p>
+                <div class="chart-grid">
+                    <div class="chart-card">
+                        <h3>Per-User Throughput Range</h3>
+                        <div class="chart-desc">
+                            Per-user generation speed across context lengths.
+                            Band shows range from single-user to max
+                            concurrency.
+                        </div>
+                        <img
+                            src="{{IMG_THROUGHPUT_RANGE}}"
+                            style="width: 100%; border-radius: 8px"
+                        />
+                        <div class="chart-caption">
+                            {{CAPTION_THROUGHPUT_RANGE}}
+                        </div>
+                        <div class="chart-explainer">
+                            {{EXPLAINER_THROUGHPUT_RANGE}}
+                        </div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>Time to First Token Range</h3>
+                        <div class="chart-desc">
+                            TTFT across context lengths. Lower is better for
+                            responsive user experience.
+                        </div>
+                        <img
+                            src="{{IMG_TTFT_RANGE}}"
+                            style="width: 100%; border-radius: 8px"
+                        />
+                        <div class="chart-caption">{{CAPTION_TTFT_RANGE}}</div>
+                        <div class="chart-explainer">
+                            {{EXPLAINER_TTFT_RANGE}}
+                        </div>
+                    </div>
+                    <div class="chart-card full-width">
+                        <h3>System Throughput</h3>
+                        <div class="chart-desc">
+                            Aggregate decode throughput (tok/s) across all
+                            concurrent requests at each context length.
+                        </div>
+                        <img
+                            src="{{IMG_SYSTEM_THROUGHPUT}}"
+                            style="width: 100%; border-radius: 8px"
+                        />
+                        <div class="chart-caption">
+                            {{CAPTION_SYSTEM_THROUGHPUT}}
+                        </div>
+                        {{SUMMARY_TABLE_HTML}}
+                        <div class="narrative-prose">
+                            {{NARRATIVE_SYSTEM_THROUGHPUT}}
+                        </div>
+                        <div class="chart-explainer">
+                            {{EXPLAINER_SYSTEM_THROUGHPUT}}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section: Technical Analysis -->
+            <div class="section">
+                <div class="section-label">Analysis</div>
+                <h2>Technical Analysis</h2>
+                <p class="description">
+                    Deep dive into per-user metrics across context lengths at
+                    different concurrency levels.
+                </p>
+
+                <!-- Reference thresholds -->
+                <div
+                    class="chart-card"
+                    style="
+                        margin-bottom: 24px;
+                        background: var(--bg-tertiary);
+                        border-color: rgba(59, 130, 246, 0.15);
+                    "
+                >
+                    <h3 style="color: var(--blue); margin-bottom: 8px">
+                        What good looks like
+                    </h3>
+                    <div
+                        style="
+                            font-size: 13px;
+                            color: var(--text-muted);
+                            line-height: 1.7;
+                        "
+                    >
+                        Industry reference points from
+                        <a
+                            href="https://www.millstoneai.com"
+                            style="color: var(--blue); text-decoration: none"
+                            >Millstone AI</a
+                        >
+                        benchmarks on H200 SXM / RTX Pro 6000 Blackwell
+                        hardware:
+                        <div
+                            style="
+                                display: grid;
+                                grid-template-columns: 1fr 1fr;
+                                gap: 12px 32px;
+                                margin-top: 12px;
+                            "
+                        >
+                            <div>
+                                <strong style="color: var(--text-primary)"
+                                    >Inter-Token Latency:</strong
+                                >
+                                &lt;10ms excellent, &lt;20ms good, &gt;70ms
+                                poor. Under 20ms feels instantaneous to users.
+                            </div>
+                            <div>
+                                <strong style="color: var(--text-primary)"
+                                    >Per-User Decode:</strong
+                                >
+                                &gt;150 tok/s excellent (short ctx), &gt;80
+                                tok/s good (long ctx). Below 30 tok/s noticeably
+                                slow.
+                            </div>
+                            <div>
+                                <strong style="color: var(--text-primary)"
+                                    >Scaling Efficiency:</strong
+                                >
+                                &gt;90% excellent, &gt;70% good, &lt;50% poor.
+                                Measures how well throughput scales with
+                                concurrency.
+                            </div>
+                            <div>
+                                <strong style="color: var(--text-primary)"
+                                    >TTFT:</strong
+                                >
+                                &lt;100ms excellent (short ctx), &lt;2s good
+                                (32K ctx), &lt;20s acceptable (128K ctx). Grows
+                                with context length.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="chart-grid">
+                    <div class="chart-card full-width">
+                        <h3>Inter-Token Latency</h3>
+                        <div class="chart-desc">
+                            Average inter-token latency across context lengths
+                            at each concurrency level. Lower is better — under
+                            20ms feels instantaneous.
+                        </div>
+                        <img
+                            src="{{IMG_ITL}}"
+                            style="width: 100%; border-radius: 8px"
+                        />
+                        <div class="chart-caption">{{CAPTION_ITL}}</div>
+                        <div class="chart-explainer">{{EXPLAINER_ITL}}</div>
+                    </div>
+                    <div class="chart-card full-width">
+                        <h3>Per-User Decode Speed</h3>
+                        <div class="chart-desc">
+                            Per-user decode speed across context lengths at each
+                            concurrency level. Higher is better.
+                        </div>
+                        <img
+                            src="{{IMG_DECODE_SPEED}}"
+                            style="width: 100%; border-radius: 8px"
+                        />
+                        <div class="chart-caption">
+                            {{CAPTION_DECODE_SPEED}}
+                        </div>
+                        <div class="chart-explainer">
+                            {{EXPLAINER_DECODE_SPEED}}
+                        </div>
+                    </div>
+                    <div class="chart-card full-width">
+                        <h3>Scaling Efficiency</h3>
+                        <div class="chart-desc">
+                            How well throughput scales with concurrency. 100%
+                            means no per-user speed loss when adding users.
+                        </div>
+                        <img
+                            src="{{IMG_SCALING_EFFICIENCY}}"
+                            style="width: 100%; border-radius: 8px"
+                        />
+                        <div class="chart-caption">
+                            {{CAPTION_SCALING_EFFICIENCY}}
+                        </div>
+                        <div class="chart-explainer">
+                            {{EXPLAINER_SCALING_EFFICIENCY}}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section: Capacity Analysis -->
+            <div class="section">
+                <div class="section-label">Capacity</div>
+                <h2>Capacity Analysis</h2>
+                <p class="description">
+                    How many concurrent requests can the system handle before
+                    quality degrades below acceptable thresholds? Each scenario
+                    shows measured data at tested concurrency levels.
+                </p>
+
+                <!-- Capacity summary cards -->
+                <div class="key-metrics" style="margin-bottom: 32px">
+                    {{CAPACITY_CARDS_HTML}}
+                </div>
+
+                <!-- Capacity charts -->
+                {{CAPACITY_CHARTS_HTML}}
+            </div>
+
+
+            <!-- Section: Methodology -->
+            <div class="section">
+                <div class="section-label">Methodology</div>
+                <h2>Methodology</h2>
+                <p class="description">
+                    Benchmarks were run against a live endpoint using streaming
+                    completions. TTFT, inter-token latency, and decode speed are
+                    measured directly from the token stream. All capacity charts
+                    show only measured data points at tested concurrency levels.
+                </p>
+                <div class="chart-grid" style="gap: 16px">
+                    <div
+                        class="metric-card"
+                        style="background: var(--bg-tertiary)"
+                    >
+                        <div class="label">TTFT (Time to First Token)</div>
+                        <div class="detail" style="color: var(--text-primary)">
+                            Measured from request start to first streamed token
+                        </div>
+                    </div>
+                    <div
+                        class="metric-card"
+                        style="background: var(--bg-tertiary)"
+                    >
+                        <div class="label">Decode speed</div>
+                        <div class="detail" style="color: var(--text-primary)">
+                            Measured from token stream: output_tokens /
+                            decode_time
+                        </div>
+                    </div>
+                    <div
+                        class="metric-card"
+                        style="background: var(--bg-tertiary)"
+                    >
+                        <div class="label">Scaling efficiency</div>
+                        <div class="detail" style="color: var(--text-primary)">
+                            actual_throughput / (bs1_throughput x batch_size) x
+                            100
+                        </div>
+                    </div>
+                    <div
+                        class="metric-card"
+                        style="background: var(--bg-tertiary)"
+                    >
+                        <div class="label">E2E latency</div>
+                        <div class="detail" style="color: var(--text-primary)">
+                            TTFT + decode_time (measured end-to-end)
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="footer">Benchmark run on {{DATE_STR}}</div>
+        </div>
+    </body>
+</html>

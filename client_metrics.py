@@ -260,6 +260,102 @@ def load_text_dataset(num_samples: int, random_sample: bool = True) -> List[Requ
     return requests
 
 
+def load_text_dataset_with_length(
+    num_samples: int,
+    target_token_length: int,
+    random_sample: bool = True,
+) -> List[RequestInput]:
+    """Load text prompts targeting a specific input token length.
+
+    Uses a seed corpus and repeats/truncates to hit the target length.
+    Approximately 1 token ~ 4 characters for English text.
+    """
+    import random
+    import textwrap
+
+    CHARS_PER_TOKEN = 4  # conservative estimate
+    target_chars = target_token_length * CHARS_PER_TOKEN
+
+    # Seed paragraphs covering diverse topics — will be repeated to fill length
+    seed_paragraphs = [
+        "The development of large language models has transformed the landscape of artificial intelligence research. "
+        "These models, trained on vast corpora of text data, demonstrate remarkable capabilities in understanding and "
+        "generating human language. From translation to summarization, code generation to creative writing, the "
+        "applications continue to expand as model architectures and training techniques improve.",
+
+        "Climate change represents one of the most pressing challenges facing humanity in the twenty-first century. "
+        "Rising global temperatures lead to melting ice caps, rising sea levels, and increasingly frequent extreme "
+        "weather events. Scientists emphasize the importance of reducing greenhouse gas emissions through renewable "
+        "energy adoption, improved agricultural practices, and international cooperation on environmental policy.",
+
+        "The human brain contains approximately 86 billion neurons, each forming thousands of synaptic connections. "
+        "This incredibly complex network enables consciousness, memory, emotion, and all cognitive functions. "
+        "Neuroscience research continues to reveal the mechanisms underlying learning and decision-making, "
+        "with implications for treating neurological disorders and developing brain-computer interfaces.",
+
+        "Modern software engineering practices emphasize continuous integration, automated testing, and agile "
+        "methodologies. Teams deploy microservices architectures to improve scalability and maintainability. "
+        "Container orchestration platforms like Kubernetes manage distributed systems, while observability "
+        "tools provide insights into application performance and reliability across complex infrastructures.",
+
+        "The history of mathematics spans thousands of years, from ancient Babylonian number systems to modern "
+        "abstract algebra and topology. Key breakthroughs include the development of calculus by Newton and "
+        "Leibniz, the formalization of set theory by Cantor, and the proof of Fermat's Last Theorem by Wiles. "
+        "Mathematics serves as the foundation for physics, computer science, and engineering disciplines.",
+
+        "Quantum computing leverages quantum mechanical phenomena such as superposition and entanglement to "
+        "perform computations that would be intractable for classical computers. Quantum bits, or qubits, "
+        "can exist in multiple states simultaneously, enabling massive parallelism for specific problem types "
+        "including cryptography, optimization, and molecular simulation for drug discovery.",
+
+        "The global economy operates through interconnected financial markets, trade networks, and monetary "
+        "systems. Central banks manage inflation and employment through interest rate policies and open market "
+        "operations. International trade agreements facilitate commerce between nations while creating complex "
+        "dependencies that can amplify both prosperity and economic shocks across borders.",
+
+        "Biodiversity loss threatens ecosystem stability worldwide. Deforestation, ocean acidification, and "
+        "habitat fragmentation reduce species populations at unprecedented rates. Conservation biologists work "
+        "to establish protected areas, restore degraded habitats, and develop sustainable resource management "
+        "practices that balance human needs with ecological preservation.",
+    ]
+
+    corpus = " ".join(seed_paragraphs)
+
+    requests = []
+    for idx in range(num_samples):
+        # Build prompt to target length by repeating corpus
+        if target_chars <= len(corpus):
+            # Truncate — pick a random offset for variety
+            if random_sample:
+                offset = random.randint(0, max(0, len(corpus) - target_chars))
+            else:
+                offset = 0
+            text = corpus[offset : offset + target_chars]
+        else:
+            # Repeat corpus to fill
+            repeats = (target_chars // len(corpus)) + 1
+            pool = corpus * repeats
+            if random_sample:
+                offset = random.randint(0, max(0, len(pool) - target_chars))
+            else:
+                offset = (idx * 137) % max(1, len(pool) - target_chars)
+            text = pool[offset : offset + target_chars]
+
+        prompt = f"Please analyze and summarize the following text:\n\n{text}"
+
+        requests.append(RequestInput(
+            prompt=prompt,
+            image_url=None,
+            request_id=idx,
+            prompt_length=len(prompt),
+            image_size_bytes=0,
+        ))
+
+    print(f"Created {len(requests)} requests targeting ~{target_token_length} input tokens "
+          f"(~{target_chars} chars each)")
+    return requests
+
+
 def print_no_success_failure_messages(outputs: List[RequestOutput]) -> None:
     """Print aggregated failure reasons when no requests succeeded."""
     failures = [o for o in outputs if not o.success]

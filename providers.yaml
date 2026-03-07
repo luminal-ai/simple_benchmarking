@@ -1,0 +1,52 @@
+# Provider benchmark configuration
+#
+# Each provider entry defines an OpenAI-compatible API endpoint to benchmark.
+# Run with: python run_providers.py [--config providers.yaml]
+#
+# Environment variables referenced in api_key_env must be set before running.
+
+defaults:
+  num_requests: 100
+  max_tokens: 256
+  model_type: text
+  rates: "1,5,10,25,50,100"
+  inter_run_wait_seconds: 30
+
+providers:
+  # --- Example: local vLLM server ---
+  # - name: "local-vllm"
+  #   url: "http://localhost:8000/v1/chat/completions"
+  #   model: "meta-llama/Llama-3-8B-Instruct"
+  #   gpu: "1xH100"
+
+  # --- Example: Together AI ---
+  # - name: "together-ai"
+  #   url: "https://api.together.xyz/v1/chat/completions"
+  #   model: "meta-llama/Llama-3-70B-Instruct"
+  #   api_key_env: "TOGETHER_API_KEY"
+  #   gpu: "Together AI"
+
+  # --- Example: Fireworks ---
+  # - name: "fireworks"
+  #   url: "https://api.fireworks.ai/inference/v1/chat/completions"
+  #   model: "accounts/fireworks/models/llama-v3-70b-instruct"
+  #   api_key_env: "FIREWORKS_API_KEY"
+  #   gpu: "Fireworks AI"
+
+  # --- Example: Groq ---
+  # - name: "groq"
+  #   url: "https://api.groq.com/openai/v1/chat/completions"
+  #   model: "llama3-70b-8192"
+  #   api_key_env: "GROQ_API_KEY"
+  #   gpu: "Groq LPU"
+  #   max_tokens: 256
+
+  # --- Example: custom overrides per provider ---
+  # - name: "provider-heavy"
+  #   url: "https://api.example.com/v1/chat/completions"
+  #   model: "big-model"
+  #   api_key_env: "EXAMPLE_API_KEY"
+  #   num_requests: 50
+  #   rates: "1,5,10"
+  #   max_tokens: 512
+  #   disable_server_metrics: true
