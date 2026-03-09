@@ -50,6 +50,114 @@ from metrics_printer import (
 from convert_results import convert
 
 
+async def run_single_benchmark_concurrency(args, concurrency: int, preloaded_requests: Optional[List[RequestInput]] = None):
+    """Runs one benchmark at fixed concurrency (exactly N requests in flight) and returns a result dict."""
+    print(f"\n=== Running benchmark at concurrency={concurrency} ===")
+    base_url = args.url.rsplit('/v1/', 1)[0] if '/v1/' in args.url else args.url.rsplit('/', 1)[0]
+
+    server_metrics_before = None
+    if not args.disable_server_metrics:
+        print("Fetching server metrics (before)...")
+        server_metrics_before = await fetch_server_metrics(base_url)
+        if server_metrics_before:
+            print("✓ Server metrics captured (before)")
+        else:
+            print("⚠ Could not fetch server metrics - will show client POV only")
+
+    if preloaded_requests is not None:
+        requests = preloaded_requests
+    else:
+        model_type = getattr(args, 'model_type', 'vision')
+        if model_type == 'text':
+            requests = load_text_dataset(args.num_requests, random_sample=True)
+        else:
+            requests = load_coco_dataset(args.num_requests, random_sample=True)
+
+    if not requests:
+        raise ValueError("No requests loaded from dataset")
+
+    timeout = aiohttp.ClientTimeout(total=6*60*60)
+    semaphore = asyncio.Semaphore(concurrency)
+    outputs: List[RequestOutput] = []
+
+    async def _throttled_request(session, req):
+        async with semaphore:
+            return await send_chat_request(
+                session=session, url=args.url, request_input=req,
+                model=args.model, max_tokens=args.max_tokens,
+                api_key=args.api_key, pbar=pbar,
+            )
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        pbar = None if args.disable_tqdm else tqdm(total=len(requests), desc=f"Requests @c={concurrency}")
+        benchmark_start = time.perf_counter()
+        tasks = [asyncio.create_task(_throttled_request(session, req)) for req in requests]
+        outputs = await asyncio.gather(*tasks)
+        benchmark_duration = time.perf_counter() - benchmark_start
+        if pbar:
+            pbar.close()
+
+    server_metrics_after = None
+    if not args.disable_server_metrics and server_metrics_before:
+        server_metrics_after = await fetch_server_metrics(base_url)
+
+    client_metrics = calculate_metrics(outputs, benchmark_duration)
+    server_delta = None
+    if server_metrics_before and server_metrics_after:
+        server_delta = calculate_server_metrics_delta(server_metrics_before, server_metrics_after, benchmark_duration)
+
+    print_metrics(client_metrics, server_delta, requests)
+
+    outdir = args.output_dir if hasattr(args, 'output_dir') else "."
+    rate_suffix = f"_conc_{concurrency}"
+    plot_distribution_skewness(outputs, outdir, rate_suffix)
+
+    successful = [o for o in outputs if o.success]
+    num_successful = len(successful)
+    avg_prompt_tokens = (
+        sum(o.prompt_tokens for o in successful) / num_successful if num_successful else 0
+    )
+    avg_completion_tokens = (
+        sum(o.completion_tokens for o in successful) / num_successful if num_successful else 0
+    )
+
+    bundle = {
+        "request_rate": concurrency,  # Use concurrency as the "rate" for report compat
+        "num_total": len(outputs),
+        "num_successful": num_successful,
+        "avg_prompt_tokens": avg_prompt_tokens,
+        "avg_completion_tokens": avg_completion_tokens,
+        "client_metrics": {
+            "ttft_ms": {
+                "p50": client_metrics.ttft_p50_ms,
+                "p95": client_metrics.ttft_p95_ms,
+                "p99": client_metrics.ttft_p99_ms,
+                "avg": client_metrics.ttft_avg_ms,
+            },
+            "e2e_ms": {
+                "p50": client_metrics.e2e_p50_ms,
+                "p95": client_metrics.e2e_p95_ms,
+                "p99": client_metrics.e2e_p99_ms,
+                "avg": client_metrics.e2e_avg_ms,
+            },
+            "itl_ms": {
+                "p50": client_metrics.itl_p50_ms,
+                "p95": client_metrics.itl_p95_ms,
+                "p99": client_metrics.itl_p99_ms,
+                "avg": client_metrics.itl_avg_ms,
+            },
+            "toks": {
+                "p50": client_metrics.toks_p50,
+                "p95": client_metrics.toks_p95,
+                "p99": client_metrics.toks_p99,
+                "avg": client_metrics.toks_avg,
+            },
+        },
+        "server_metrics": server_delta,
+    }
+    return bundle
+
+
 async def run_single_benchmark(args, request_rate: float, preloaded_requests: Optional[List[RequestInput]] = None):
     """Runs one benchmark at a given request_rate and returns a result dict."""
     print(f"\n=== Running benchmark at {request_rate} req/s ===")
@@ -193,6 +301,22 @@ async def run_multi_rate_benchmark(args, rates: List[float], preloaded_requests:
     return results
 
 
+async def run_multi_concurrency_benchmark(args, concurrencies: List[int], preloaded_requests: Optional[List[RequestInput]] = None) -> List[dict]:
+    """Runs benchmarks across multiple fixed-concurrency levels."""
+    results = []
+    for idx, c in enumerate(concurrencies):
+        bundle = await run_single_benchmark_concurrency(args, c, preloaded_requests)
+        results.append(bundle)
+
+        if idx < len(concurrencies) - 1:
+            wait_s = max(0, int(args.inter_run_wait_seconds))
+            if wait_s > 0:
+                print(f"\nCooling down for {wait_s} seconds before next concurrency level...")
+                await asyncio.sleep(wait_s)
+
+    return results
+
+
 def build_and_plot(results: List[dict], outdir: str, args):
     """Extracts series from results and generates plots + summary JSON."""
     _ensure_outdir(outdir)
@@ -293,6 +417,52 @@ async def run_multi_scenario_benchmark(args, rates: List[float], input_lengths: 
     _generate_report(summary, args.output_dir, args)
 
 
+async def run_multi_scenario_concurrency_benchmark(args, concurrencies: List[int], input_lengths: List[int]):
+    """Run benchmarks across multiple input lengths and fixed concurrency levels.
+
+    Like run_multi_scenario_benchmark but uses fixed concurrency (semaphore)
+    instead of Poisson arrival rates. This ensures exactly N requests in flight.
+    """
+    _ensure_outdir(args.output_dir)
+    all_scenarios = []
+
+    for il_idx, input_len in enumerate(input_lengths):
+        il_label = f"{input_len // 1024}k" if input_len >= 1024 else str(input_len)
+        print(f"\n{'='*60}")
+        print(f"  Scenario {il_idx+1}/{len(input_lengths)}: input_length={input_len} tokens ({il_label})")
+        print(f"{'='*60}")
+
+        requests = load_text_dataset_with_length(args.num_requests, input_len, random_sample=True)
+        results = await run_multi_concurrency_benchmark(args, concurrencies, preloaded_requests=requests)
+
+        all_scenarios.append({
+            "input_length": input_len,
+            "rates": [float(c) for c in concurrencies],  # compat with report pipeline
+            "results": results,
+        })
+
+        print_prefill_decode_tables(results, args.num_requests)
+
+        if il_idx < len(input_lengths) - 1:
+            wait_s = max(0, int(args.inter_run_wait_seconds))
+            if wait_s > 0:
+                print(f"\nCooling down {wait_s}s before next input length...")
+                await asyncio.sleep(wait_s)
+
+    summary = {
+        "url": args.url,
+        "model": args.model,
+        "model_type": getattr(args, 'model_type', 'text'),
+        "num_requests": args.num_requests,
+        "max_tokens": args.max_tokens,
+        "input_lengths": input_lengths,
+        "rates": [float(c) for c in concurrencies],
+        "scenarios": all_scenarios,
+    }
+    _save_json(os.path.join(args.output_dir, "benchmark_summary.json"), summary)
+    _generate_report(summary, args.output_dir, args)
+
+
 def _generate_report(summary: dict, outdir: str, args):
     """Convert benchmark results and generate HTML report."""
     try:
@@ -383,21 +553,37 @@ def main():
         default=30,
         help="Seconds to wait between multi-run request rates to avoid crossover (default: 30)"
     )
+    parser.add_argument(
+        "--concurrencies",
+        type=str,
+        help="Comma-separated fixed concurrency levels (e.g., '1,2,4,8,16,32'). "
+             "Uses fixed-concurrency mode: exactly N requests in flight at a time. "
+             "Mutually exclusive with --rates."
+    )
 
     args = parser.parse_args()
 
     if args.run_multi:
-        rates = parse_rates(args.rates) if args.rates else [1.0, 10.0, 100.0]
-
-        if args.input_lengths:
-            # Multi-scenario sweep: vary both input length and request rate
-            input_lengths = [int(x.strip()) for x in args.input_lengths.split(",")]
-            asyncio.run(run_multi_scenario_benchmark(args, rates, input_lengths))
+        if args.concurrencies:
+            # Fixed-concurrency mode
+            concurrencies = [int(x.strip()) for x in args.concurrencies.split(",")]
+            if args.input_lengths:
+                input_lengths = [int(x.strip()) for x in args.input_lengths.split(",")]
+                asyncio.run(run_multi_scenario_concurrency_benchmark(args, concurrencies, input_lengths))
+            else:
+                results = asyncio.run(run_multi_concurrency_benchmark(args, concurrencies))
+                build_and_plot(results, args.output_dir, args)
+                print_prefill_decode_tables(results, args.num_requests)
         else:
-            # Single scenario, multiple rates (original behavior)
-            results = asyncio.run(run_multi_rate_benchmark(args, rates))
-            build_and_plot(results, args.output_dir, args)
-            print_prefill_decode_tables(results, args.num_requests)
+            # Poisson rate mode (original behavior)
+            rates = parse_rates(args.rates) if args.rates else [1.0, 10.0, 100.0]
+            if args.input_lengths:
+                input_lengths = [int(x.strip()) for x in args.input_lengths.split(",")]
+                asyncio.run(run_multi_scenario_benchmark(args, rates, input_lengths))
+            else:
+                results = asyncio.run(run_multi_rate_benchmark(args, rates))
+                build_and_plot(results, args.output_dir, args)
+                print_prefill_decode_tables(results, args.num_requests)
     else:
         asyncio.run(run_benchmark(args))
 
