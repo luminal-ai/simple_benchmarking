@@ -463,7 +463,7 @@ async def send_chat_request(
                     continue
 
                 delta = choices[0].get("delta", {})
-                content = delta.get("content", "")
+                content = delta.get("content", "") or delta.get("reasoning_content", "") or delta.get("reasoning", "")
                 if content:
                     timestamp = time.perf_counter()
                     if output.ttft == 0.0:
