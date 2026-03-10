@@ -102,7 +102,7 @@ def _convert_dual_mode(
         "dual_mode": True,
     }
 
-    for mode_key in ("peak_performance", "sustained_load"):
+    for mode_key in ("peak_performance", "sustained_load", "queue_depth"):
         mode_data = summary.get(mode_key)
         if mode_data is None:
             continue

@@ -40,6 +40,8 @@ class RequestOutput:
     itl: List[float] = field(default_factory=list)  # Inter-token latencies
     prompt_tokens: int = 0  # Prompt tokens including image tokens
     completion_tokens: int = 0  # Completion tokens from usage
+    send_time: float = 0.0  # Absolute time request was sent (perf_counter)
+    first_token_time: float = 0.0  # Absolute time first token received
 
 
 @dataclass
@@ -389,7 +391,8 @@ async def send_chat_request(
     model: str,
     max_tokens: int,
     api_key: Optional[str] = None,
-    pbar: Optional[tqdm] = None
+    pbar: Optional[tqdm] = None,
+    first_token_event: Optional[asyncio.Event] = None,
 ) -> RequestOutput:
     """Send a single chat completion request and collect client-side metrics."""
     output = RequestOutput(request_id=request_input.request_id)
@@ -426,6 +429,7 @@ async def send_chat_request(
         headers["Authorization"] = f"Bearer {api_key}"
 
     start_time = time.perf_counter()
+    output.send_time = start_time
     most_recent_timestamp = start_time
     generated_text = ""
 
@@ -468,6 +472,9 @@ async def send_chat_request(
                     timestamp = time.perf_counter()
                     if output.ttft == 0.0:
                         output.ttft = timestamp - start_time
+                        output.first_token_time = timestamp
+                        if first_token_event is not None:
+                            first_token_event.set()
                     else:
                         output.itl.append(timestamp - most_recent_timestamp)
                     most_recent_timestamp = timestamp
@@ -488,6 +495,95 @@ async def send_chat_request(
     if pbar:
         pbar.update(1)
     return output
+
+
+def infer_queue_depths(outputs: List[RequestOutput]) -> List[dict]:
+    """Infer the queue depth each request experienced from absolute timestamps.
+
+    For each successful request, the "queue depth at arrival" is the number of
+    other requests that were already sent but had not yet received their first
+    token at the moment this request was sent.  Equivalently: how many requests
+    were still in prefill or waiting when this one joined.
+
+    Returns a list of dicts sorted by send_time:
+        [{"request_id": int, "send_time": float, "first_token_time": float,
+          "ttft": float, "queue_depth_at_send": int, "decoding_at_send": int}, ...]
+
+    ``queue_depth_at_send`` = requests sent before this one whose first_token_time
+    is *after* this request's send_time (they hadn't started decoding yet).
+
+    ``decoding_at_send`` = requests sent before this one whose first_token_time
+    is *before* this request's send_time but whose e2e completion time is after
+    (they were actively decoding when this request arrived).
+    """
+    successful = [
+        o for o in outputs
+        if o.success and o.send_time > 0 and o.first_token_time > 0
+    ]
+    if not successful:
+        return []
+
+    # Sort by send_time so we process in arrival order
+    by_send = sorted(successful, key=lambda o: o.send_time)
+
+    result = []
+    for i, req in enumerate(by_send):
+        queued = 0
+        decoding = 0
+        for j in range(i):
+            earlier = by_send[j]
+            if earlier.first_token_time > req.send_time:
+                # Earlier request hadn't received first token yet → queued/prefilling
+                queued += 1
+            elif earlier.send_time + earlier.e2e_latency > req.send_time:
+                # Earlier request was actively decoding
+                decoding += 1
+
+        result.append({
+            "request_id": req.request_id,
+            "send_time": req.send_time,
+            "first_token_time": req.first_token_time,
+            "ttft": req.ttft,
+            "queue_depth_at_send": queued,
+            "decoding_at_send": decoding,
+        })
+
+    return result
+
+
+def summarize_by_queue_depth(inferred: List[dict]) -> List[dict]:
+    """Aggregate inferred queue data into per-depth-bucket summaries.
+
+    Groups requests by total in-flight count (queue_depth_at_send + decoding_at_send)
+    and computes average TTFT for each bucket.
+
+    Returns list sorted by in_flight count:
+        [{"in_flight": int, "count": int, "avg_ttft": float,
+          "avg_queued": float, "avg_decoding": float}, ...]
+    """
+    if not inferred:
+        return []
+
+    from collections import defaultdict
+
+    buckets: dict = defaultdict(list)
+    for entry in inferred:
+        in_flight = entry["queue_depth_at_send"] + entry["decoding_at_send"]
+        buckets[in_flight].append(entry)
+
+    summaries = []
+    for depth in sorted(buckets):
+        entries = buckets[depth]
+        ttfts = [e["ttft"] for e in entries]
+        summaries.append({
+            "in_flight": depth,
+            "count": len(entries),
+            "avg_ttft": sum(ttfts) / len(ttfts),
+            "avg_queued": sum(e["queue_depth_at_send"] for e in entries) / len(entries),
+            "avg_decoding": sum(e["decoding_at_send"] for e in entries) / len(entries),
+        })
+
+    return summaries
 
 
 async def generate_requests(requests: List[RequestInput], request_rate: float):
