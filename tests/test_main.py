@@ -401,7 +401,8 @@ class TestRunQueueDepthDiscovery:
             result = await run_queue_depth_discovery(args, input_len=1024)
 
         assert result["max_safe_n"] == 0
-        assert len(result["scout_results"]) == 1
+        # N=1 tested once + 2 retests (confirm_runs=3) = 3 scout results
+        assert len(result["scout_results"]) == 3
         assert len(result["narrow_results"]) == 0
         assert len(result["confirm_results"]) == 0
 

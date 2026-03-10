@@ -222,9 +222,25 @@ async def run_queue_depth_discovery(
             scout_results.append(bundle)
 
             if bundle["avg_ttft_s"] > ttft_limit:
-                first_bad_n = n
-                print(f"  Scout: N={n} exceeded limit. Upper bound found.")
-                break
+                # Re-test to avoid a single fluke declaring the upper bound
+                retest_over = 1  # already have 1 over-limit result
+                retest_under = 0
+                for rt in range(confirm_runs - 1):
+                    await _cooldown()
+                    rt_bundle = await _step(session, n, f"scout retest {rt+2}/{confirm_runs}")
+                    scout_results.append(rt_bundle)
+                    if rt_bundle["avg_ttft_s"] > ttft_limit:
+                        retest_over += 1
+                    else:
+                        retest_under += 1
+
+                if retest_over > retest_under:
+                    first_bad_n = n
+                    print(f"  Scout: N={n} confirmed over limit ({retest_over}/{confirm_runs} exceeded). Upper bound found.")
+                    break
+                else:
+                    print(f"  Scout: N={n} was a fluke ({retest_under}/{confirm_runs} passed). Continuing.")
+                    last_good_n = n
             else:
                 last_good_n = n
 
@@ -251,7 +267,21 @@ async def run_queue_depth_discovery(
                 narrow_results.append(bundle)
 
                 if bundle["avg_ttft_s"] > ttft_limit:
-                    hi = mid
+                    # Re-test to avoid fluke
+                    retest_over = 1
+                    retest_under = 0
+                    for rt in range(confirm_runs - 1):
+                        await _cooldown()
+                        rt_bundle = await _step(session, mid, f"narrow retest {rt+2}/{confirm_runs}")
+                        narrow_results.append(rt_bundle)
+                        if rt_bundle["avg_ttft_s"] > ttft_limit:
+                            retest_over += 1
+                        else:
+                            retest_under += 1
+                    if retest_over > retest_under:
+                        hi = mid
+                    else:
+                        lo = mid
                 else:
                     lo = mid
 
