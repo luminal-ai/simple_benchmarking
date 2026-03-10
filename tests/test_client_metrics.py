@@ -81,10 +81,11 @@ class TestCalculateMetrics:
         output = make_request_output(
             prompt_tokens=100,
             completion_tokens=50,
-            e2e_latency=1.5,  # 1.5 seconds
+            ttft=0.1,
+            e2e_latency=1.5,  # 1.5 seconds, decode_time = 1.5 - 0.1 = 1.4
         )
         metrics = calculate_metrics([output], duration_s=2.0)
-        expected_tps = (100 + 50) / 1.5
+        expected_tps = 50 / (1.5 - 0.1)  # completion_tokens / decode_time
         assert metrics.toks_avg == pytest.approx(expected_tps, rel=0.01)
 
     def test_single_request(self):

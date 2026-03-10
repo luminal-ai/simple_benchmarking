@@ -156,9 +156,13 @@ def print_prefill_decode_tables(results: List[dict], num_requests: int):
         e2e_avg_ms = _safe_get(cm, ["e2e_ms", "avg"], 0.0)
         client_tok_p50 = _safe_get(cm, ["toks", "p50"], 0.0)
         client_tok_avg = _safe_get(cm, ["toks", "avg"], 0.0)
-        # Success %
+        # Success % — prefer server metric, fall back to client-side count
         succ = _safe_get(sm, ["successful_requests"], 0.0)
-        success_pct = f"{(succ / num_requests) * 100:.1f}%"
+        if succ == 0:
+            succ = res.get("num_successful", 0)
+        num_total = res.get("num_total", num_requests)
+        denom = num_total if num_total > 0 else num_requests
+        success_pct = f"{(succ / denom) * 100:.1f}%"
 
         # Server metrics (may be missing)
         prefill_p50 = _safe_get(sm, ["prefill_throughput", "p50"], 0.0)

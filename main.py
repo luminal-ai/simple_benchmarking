@@ -153,53 +153,187 @@ async def _run_queue_depth_step(
 
 
 async def run_queue_depth_discovery(
-    args, input_len: int, max_requests: int = 64,
-) -> List[dict]:
-    """Adaptively discover queue depth limits for a given input length.
+    args, input_len: int, max_requests: int = 256,
+) -> dict:
+    """Discover the maximum queue depth before TTFT exceeds the limit.
 
-    Strategy:
-      1. N=1: fire 1 request → baseline TTFT
-      2. N=2, 3, 4, ... (linear ramp)
-      3. Stop when avg TTFT > QUEUE_DEPTH_TTFT_LIMIT_S (10s)
+    Three-phase approach:
 
-    Returns list of result bundles, one per N tested.
+    Phase A — Scout (exponential): N = 1, 2, 4, 8, 16, 32, ...
+        Quickly finds an upper bound where TTFT exceeds the limit.
+
+    Phase B — Narrow (binary search): between last_good and first_bad
+        Finds the exact crossover point.
+
+    Phase C — Confirm (repeat): runs max_safe_n multiple times
+        Ensures the result is repeatable, not a fluke.  If confirmation
+        fails, drops max_safe_n down by 1 and retries.
+
+    Returns a dict:
+        {
+            "input_length": int,
+            "max_safe_n": int,         # highest N consistently under limit
+            "ttft_limit": float,
+            "scout_results": [...],
+            "narrow_results": [...],
+            "confirm_results": [...],
+            "all_results": [...],       # everything sorted by N
+        }
     """
     ttft_limit = getattr(args, 'queue_ttft_limit', QUEUE_DEPTH_TTFT_LIMIT_S)
+    max_n = getattr(args, 'max_queue_depth', 256)
+    confirm_runs = getattr(args, 'queue_confirm_runs', 3)
+    cooldown_s = min(5, max(0, int(args.inter_run_wait_seconds)))
 
-    # Load enough requests for the max we might need
     requests = load_text_dataset_with_length(max_requests, input_len, random_sample=True)
 
-    results = []
+    scout_results = []
+    narrow_results = []
+    confirm_results = []
+
     timeout = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
+    async def _step(session, n, label=""):
+        tag = f" [{label}]" if label else ""
+        print(f"\n=== Queue depth{tag}: N={n}, input_length={input_len} ===")
+        bundle = await _run_queue_depth_step(session, args, n, requests)
+        print(f"  N={n}: avg TTFT = {bundle['avg_ttft_s']:.2f}s (limit: {ttft_limit}s)")
+        return bundle
+
+    async def _cooldown():
+        if cooldown_s > 0:
+            print(f"  Cooling down {cooldown_s}s...")
+            await asyncio.sleep(cooldown_s)
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
+
+        # ── Phase A: Scout (exponential) ──────────────────────────
+        print(f"\n{'─'*50}")
+        print(f"  Phase A: Scout (exponential) — input_length={input_len}")
+        print(f"{'─'*50}")
+
+        last_good_n = 0   # last N where TTFT was under limit
+        first_bad_n = None  # first N where TTFT exceeded limit
+
         n = 1
-        while n <= len(requests):
-            print(f"\n=== Queue depth discovery: N={n}, input_length={input_len} ===")
+        while n <= max_n:
+            bundle = await _step(session, n, "scout")
+            scout_results.append(bundle)
 
-            bundle = await _run_queue_depth_step(session, args, n, requests)
-            avg_ttft = bundle["avg_ttft_s"]
-            results.append(bundle)
-
-            print(f"  N={n}: avg TTFT = {avg_ttft:.2f}s (limit: {ttft_limit}s)")
-
-            if avg_ttft > ttft_limit:
-                print(f"  TTFT exceeded {ttft_limit}s — stopping ramp for this input length.")
+            if bundle["avg_ttft_s"] > ttft_limit:
+                first_bad_n = n
+                print(f"  Scout: N={n} exceeded limit. Upper bound found.")
                 break
+            else:
+                last_good_n = n
 
-            # Cooldown between steps
-            if n < len(requests):
-                wait_s = max(0, int(args.inter_run_wait_seconds))
-                if wait_s > 0:
-                    print(f"  Cooling down {wait_s}s...")
-                    await asyncio.sleep(wait_s)
+            await _cooldown()
+            next_n = n * 2
+            if next_n > max_n:
+                next_n = max_n
+            if next_n <= n:
+                # Can't go higher — we've tested max_n already
+                break
+            n = next_n
 
-            n += 1
+        # ── Phase B: Narrow (binary search) ───────────────────────
+        if first_bad_n is not None and last_good_n > 0 and first_bad_n - last_good_n > 1:
+            print(f"\n{'─'*50}")
+            print(f"  Phase B: Narrow (binary search) — between {last_good_n} and {first_bad_n}")
+            print(f"{'─'*50}")
 
-    print(f"\n  Queue depth discovery complete for {input_len} tokens: "
-          f"tested N=1..{n}, final avg TTFT={results[-1]['avg_ttft_s']:.2f}s")
+            lo, hi = last_good_n, first_bad_n
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                await _cooldown()
+                bundle = await _step(session, mid, "narrow")
+                narrow_results.append(bundle)
 
-    return results
+                if bundle["avg_ttft_s"] > ttft_limit:
+                    hi = mid
+                else:
+                    lo = mid
+
+            last_good_n = lo
+            first_bad_n = hi
+            print(f"  Narrow complete: max_safe_n={last_good_n}, first_bad_n={first_bad_n}")
+
+        # Handle edge cases
+        if first_bad_n is None:
+            # Never exceeded limit — max_n is safe
+            max_safe_n = last_good_n if last_good_n > 0 else max_n
+        elif last_good_n == 0:
+            # N=1 already exceeded limit
+            max_safe_n = 0
+        else:
+            max_safe_n = last_good_n
+
+        # ── Phase C: Confirm (repeat) ─────────────────────────────
+        if max_safe_n > 0:
+            print(f"\n{'─'*50}")
+            print(f"  Phase C: Confirm — N={max_safe_n} × {confirm_runs} runs")
+            print(f"{'─'*50}")
+
+            for run_idx in range(confirm_runs):
+                await _cooldown()
+                bundle = await _step(session, max_safe_n, f"confirm {run_idx+1}/{confirm_runs}")
+                confirm_results.append(bundle)
+
+                if bundle["avg_ttft_s"] > ttft_limit:
+                    print(f"  Confirm run {run_idx+1} FAILED (TTFT={bundle['avg_ttft_s']:.2f}s > {ttft_limit}s)")
+                    # Drop down and retry
+                    max_safe_n -= 1
+                    if max_safe_n <= 0:
+                        max_safe_n = 0
+                        print(f"  Dropped to max_safe_n=0. Stopping confirmation.")
+                        break
+                    print(f"  Dropping to max_safe_n={max_safe_n}, restarting confirmation.")
+                    confirm_results = []  # Reset confirms for new N
+                    run_idx = -1  # Will be 0 on next iteration
+                    # Restart the confirm loop with the new max_safe_n
+                    break
+            else:
+                # All confirm runs passed — we're done
+                avg_confirm_ttft = sum(r["avg_ttft_s"] for r in confirm_results) / len(confirm_results)
+                print(f"  Confirmed: N={max_safe_n} avg TTFT={avg_confirm_ttft:.2f}s across {confirm_runs} runs")
+
+            # If we broke out to retry with lower N, run the confirms again
+            if len(confirm_results) < confirm_runs and max_safe_n > 0:
+                confirm_results = []
+                for run_idx in range(confirm_runs):
+                    await _cooldown()
+                    bundle = await _step(session, max_safe_n, f"confirm {run_idx+1}/{confirm_runs}")
+                    confirm_results.append(bundle)
+                    if bundle["avg_ttft_s"] > ttft_limit:
+                        max_safe_n -= 1
+                        if max_safe_n <= 0:
+                            max_safe_n = 0
+                            confirm_results = []
+                            break
+
+    # ── Assemble results ──────────────────────────────────────────
+    all_results = sorted(
+        scout_results + narrow_results + confirm_results,
+        key=lambda r: r["request_rate"],
+    )
+
+    il_label = f"{input_len // 1024}k" if input_len >= 1024 else str(input_len)
+    print(f"\n{'='*50}")
+    print(f"  Queue Depth Discovery Complete — {il_label} context")
+    print(f"  Max safe queue depth: {max_safe_n}")
+    print(f"  TTFT limit: {ttft_limit}s")
+    print(f"  Steps tested: {len(all_results)}")
+    print(f"{'='*50}")
+
+    return {
+        "input_length": input_len,
+        "max_safe_n": max_safe_n,
+        "ttft_limit": ttft_limit,
+        "scout_results": scout_results,
+        "narrow_results": narrow_results,
+        "confirm_results": confirm_results,
+        "all_results": all_results,
+    }
 
 
 async def run_single_benchmark_concurrency(args, concurrency: int, preloaded_requests: Optional[List[RequestInput]] = None):
@@ -618,6 +752,65 @@ async def run_multi_scenario_concurrency_benchmark(args, concurrencies: List[int
     _generate_report(summary, args.output_dir, args)
 
 
+async def run_queue_test(args, input_lengths: List[int]):
+    """Standalone queue depth test — no concurrency sweep, just discovery.
+
+    For each input length, runs the 3-phase discovery (scout → narrow → confirm)
+    and saves a queue_summary.json with per-scenario max_safe_n values.
+    """
+    _ensure_outdir(args.output_dir)
+    max_queue_requests = getattr(args, 'max_queue_depth', 256)
+
+    all_scenarios = []
+    for il_idx, input_len in enumerate(input_lengths):
+        il_label = f"{input_len // 1024}k" if input_len >= 1024 else str(input_len)
+        print(f"\n{'#'*60}")
+        print(f"  Queue Test: Scenario {il_idx+1}/{len(input_lengths)}: {il_label} context")
+        print(f"{'#'*60}")
+
+        result = await run_queue_depth_discovery(args, input_len, max_requests=max_queue_requests)
+        all_scenarios.append(result)
+
+        if il_idx < len(input_lengths) - 1:
+            wait_s = max(0, int(args.inter_run_wait_seconds))
+            if wait_s > 0:
+                print(f"\nCooling down {wait_s}s before next input length...")
+                await asyncio.sleep(wait_s)
+
+    # Save summary
+    summary = {
+        "url": args.url,
+        "model": args.model,
+        "model_type": getattr(args, 'model_type', 'text'),
+        "max_tokens": args.max_tokens,
+        "ttft_limit": getattr(args, 'queue_ttft_limit', QUEUE_DEPTH_TTFT_LIMIT_S),
+        "scenarios": [
+            {
+                "input_length": s["input_length"],
+                "max_safe_n": s["max_safe_n"],
+                "ttft_limit": s["ttft_limit"],
+                "rates": [float(r["request_rate"]) for r in s["all_results"]],
+                "results": s["all_results"],
+            }
+            for s in all_scenarios
+        ],
+    }
+    _save_json(os.path.join(args.output_dir, "queue_summary.json"), summary)
+    _generate_report(summary, args.output_dir, args)
+
+    # Print summary table
+    print(f"\n{'='*60}")
+    print(f"  QUEUE DEPTH SUMMARY")
+    print(f"{'='*60}")
+    print(f"  {'Context':<12} {'Max Safe N':<14} {'TTFT Limit'}")
+    print(f"  {'─'*12} {'─'*14} {'─'*10}")
+    for s in all_scenarios:
+        il_label = f"{s['input_length'] // 1024}k" if s['input_length'] >= 1024 else str(s['input_length'])
+        safe = str(s['max_safe_n']) if s['max_safe_n'] > 0 else "N/A (even N=1 exceeds)"
+        print(f"  {il_label:<12} {safe:<14} {s['ttft_limit']}s")
+    print(f"{'='*60}")
+
+
 async def run_dual_mode_benchmark(args, concurrencies: List[int], input_lengths: List[int]):
     """Run both fixed-concurrency and queue-depth-discovery benchmarks.
 
@@ -639,31 +832,21 @@ async def run_dual_mode_benchmark(args, concurrencies: List[int], input_lengths:
         run_multi_concurrency_benchmark, args, concurrencies, input_lengths, label="concurrency",
     )
 
-    # --- Phase 2: Queue Depth Discovery (Adaptive) ---
+    # --- Phase 2: Queue Depth Discovery (3-phase adaptive) ---
     print(f"\n{'#'*60}")
-    print("  Phase 2/2: Queue Depth Discovery (Adaptive)")
+    print("  Phase 2/2: Queue Depth Discovery (Scout → Narrow → Confirm)")
     print(f"  Stop condition: avg TTFT > {getattr(args, 'queue_ttft_limit', QUEUE_DEPTH_TTFT_LIMIT_S)}s")
     print(f"{'#'*60}")
     all_queue_scenarios = []
-
-    # Allow enough requests for discovery (up to 64 per input length)
-    max_queue_requests = getattr(args, 'max_queue_depth', 64)
+    max_queue_requests = getattr(args, 'max_queue_depth', 256)
 
     for il_idx, input_len in enumerate(input_lengths):
-        il_label = f"{input_len // 1024}k" if input_len >= 1024 else str(input_len)
-        print(f"\n{'='*60}")
-        print(f"  Scenario {il_idx+1}/{len(input_lengths)}: input_length={input_len} tokens ({il_label})")
-        print(f"{'='*60}")
-
-        results = await run_queue_depth_discovery(args, input_len, max_requests=max_queue_requests)
-
-        # The "rates" here are the N values tested (1, 2, 3, ...)
-        n_values = [float(r["request_rate"]) for r in results]
-
+        discovery = await run_queue_depth_discovery(args, input_len, max_requests=max_queue_requests)
         all_queue_scenarios.append({
             "input_length": input_len,
-            "rates": n_values,
-            "results": results,
+            "max_safe_n": discovery["max_safe_n"],
+            "rates": [float(r["request_rate"]) for r in discovery["all_results"]],
+            "results": discovery["all_results"],
         })
 
         if il_idx < len(input_lengths) - 1:
@@ -737,6 +920,73 @@ def _generate_report(summary: dict, outdir: str, args):
         traceback.print_exc()
 
 
+def merge_phase1_and_phase2(peak_path: str, queue_path: str, args):
+    """Merge separately-collected Phase 1 and Phase 2 JSON files into a dual-mode report.
+
+    Phase 1 (benchmark_summary.json) provides peak_performance scenarios.
+    Phase 2 (queue_summary.json) provides queue_depth scenarios.
+    """
+    import json as _json
+
+    with open(peak_path) as f:
+        peak = _json.load(f)
+    with open(queue_path) as f:
+        queue = _json.load(f)
+
+    # Extract peak performance scenarios
+    if peak.get("dual_mode"):
+        # Already dual-mode — extract just peak_performance
+        peak_scenarios = peak["peak_performance"]["scenarios"]
+        peak_x_label = peak["peak_performance"].get("x_label", "Concurrent Users")
+        peak_x_values = peak["peak_performance"].get("x_values", [])
+    elif peak.get("scenarios") and isinstance(peak["scenarios"], list):
+        # Multi-scenario format
+        peak_scenarios = peak["scenarios"]
+        peak_x_label = "Concurrent Users"
+        rates = peak.get("rates") or peak.get("concurrencies") or []
+        peak_x_values = rates
+    else:
+        raise ValueError(f"Unrecognized format in {peak_path}")
+
+    # Extract queue scenarios
+    queue_scenarios = queue.get("scenarios", [])
+    if not queue_scenarios:
+        raise ValueError(f"No scenarios found in {queue_path}")
+
+    queue_x_values = [float(r["request_rate"]) for r in queue_scenarios[0].get("results", [])] if queue_scenarios else []
+
+    # Build merged dual-mode summary
+    merged = {
+        "url": peak.get("url", queue.get("url", "")),
+        "model": peak.get("model", queue.get("model", "Unknown")),
+        "model_type": peak.get("model_type", queue.get("model_type", "text")),
+        "num_requests": peak.get("num_requests", 100),
+        "max_tokens": peak.get("max_tokens", queue.get("max_tokens", 256)),
+        "dual_mode": True,
+        "input_lengths": sorted(set(
+            [s.get("input_length", 0) for s in peak_scenarios] +
+            [s.get("input_length", 0) for s in queue_scenarios]
+        )),
+        "peak_performance": {
+            "x_label": peak_x_label,
+            "x_values": peak_x_values,
+            "scenarios": peak_scenarios,
+        },
+        "queue_depth": {
+            "x_label": "Queue Depth (Simultaneous Requests)",
+            "x_values": queue_x_values,
+            "scenarios": queue_scenarios,
+        },
+    }
+
+    _ensure_outdir(args.output_dir)
+    merged_path = os.path.join(args.output_dir, "benchmark_summary.json")
+    _save_json(merged_path, merged)
+    print(f"Merged dual-mode summary: {merged_path}")
+
+    _generate_report(merged, args.output_dir, args)
+
+
 async def run_benchmark(args):
     """Back-compat single-run when user provides --request-rate explicitly."""
     print(f"Starting benchmark with {args.num_requests} requests at {args.request_rate} req/s")
@@ -808,20 +1058,50 @@ def main():
     parser.add_argument(
         "--max-queue-depth",
         type=int,
-        default=64,
-        help="Maximum N to test during queue depth discovery (default: 64).",
+        default=256,
+        help="Maximum N to test during queue depth discovery (default: 256).",
+    )
+    parser.add_argument(
+        "--queue-confirm-runs",
+        type=int,
+        default=3,
+        help="Number of confirmation runs at the discovered max safe queue depth (default: 3).",
+    )
+    parser.add_argument(
+        "--run-queue-test",
+        action="store_true",
+        help="Run standalone queue depth discovery. Uses exponential scouting, binary search narrowing, "
+             "and confirmation runs to find the max queue depth before TTFT exceeds --queue-ttft-limit. "
+             "Requires --input-lengths.",
     )
     parser.add_argument(
         "--run-dual",
         action="store_true",
-        help="Run BOTH fixed-concurrency (peak performance) and adaptive queue-depth discovery "
-             "benchmarks in one invocation. Requires --concurrencies and --input-lengths. "
-             "Queue depth ramps N=1,2,3,... until avg TTFT exceeds --queue-ttft-limit."
+        help="Run BOTH fixed-concurrency (peak performance) and queue-depth discovery "
+             "benchmarks in one invocation. Requires --concurrencies and --input-lengths."
+    )
+    parser.add_argument(
+        "--merge-results",
+        nargs=2,
+        metavar=("PEAK_JSON", "QUEUE_JSON"),
+        help="Merge separately-collected Phase 1 (benchmark_summary.json) and "
+             "Phase 2 (queue_summary.json) into a dual-mode report. "
+             "Example: --merge-results results/benchmark_summary.json results/queue_summary.json",
     )
 
     args = parser.parse_args()
 
-    if args.run_dual:
+    if args.merge_results:
+        merge_phase1_and_phase2(args.merge_results[0], args.merge_results[1], args)
+        return
+
+    if args.run_queue_test:
+        # Standalone queue depth test
+        if not args.input_lengths:
+            parser.error("--run-queue-test requires --input-lengths (e.g., '1024,4096,16384,32768')")
+        input_lengths = [int(x.strip()) for x in args.input_lengths.split(",")]
+        asyncio.run(run_queue_test(args, input_lengths))
+    elif args.run_dual:
         # Dual-mode requires concurrencies and input-lengths
         if not args.concurrencies:
             parser.error("--run-dual requires --concurrencies (e.g., '1,2,4,8,16,32')")

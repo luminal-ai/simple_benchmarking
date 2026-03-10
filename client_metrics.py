@@ -605,11 +605,11 @@ def calculate_metrics(outputs: List[RequestOutput], duration_s: float) -> Benchm
 
     ttfts = [o.ttft for o in successful if o.ttft > 0]
     e2e_latencies = [o.e2e_latency for o in successful]
-    # Use total tokens (prompt + completion) from API usage for accurate tok/s including image tokens
+    # Decode tok/s: completion tokens / decode time (e2e minus TTFT)
     toks_per_sec = [
-        (o.prompt_tokens + o.completion_tokens) / o.e2e_latency
+        o.completion_tokens / (o.e2e_latency - o.ttft)
         for o in successful
-        if o.e2e_latency > 0 and (o.prompt_tokens + o.completion_tokens) > 0
+        if (o.e2e_latency - o.ttft) > 0 and o.completion_tokens > 0
     ]
     # Flatten all inter-token latencies from all requests
     all_itls = [latency for o in successful for latency in o.itl]

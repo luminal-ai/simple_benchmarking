@@ -21,6 +21,8 @@ from main import (
     _collect_scenarios,
     run_dual_mode_benchmark,
     run_queue_depth_discovery,
+    run_queue_test,
+    merge_phase1_and_phase2,
     _generate_report,
     main,
 )
@@ -121,8 +123,11 @@ class TestCLIParsing:
         parser.add_argument("--inter-run-wait-seconds", type=int, default=30)
         parser.add_argument("--concurrencies", type=str)
         parser.add_argument("--queue-ttft-limit", type=float, default=10.0)
-        parser.add_argument("--max-queue-depth", type=int, default=64)
+        parser.add_argument("--max-queue-depth", type=int, default=256)
+        parser.add_argument("--queue-confirm-runs", type=int, default=3)
+        parser.add_argument("--run-queue-test", action="store_true")
         parser.add_argument("--run-dual", action="store_true")
+        parser.add_argument("--merge-results", nargs=2, metavar=("PEAK_JSON", "QUEUE_JSON"))
         return parser.parse_args(args_list)
 
     def test_basic_args(self):
@@ -166,6 +171,13 @@ class TestCLIParsing:
         ])
         assert args.api_key == "secret123"
 
+    def test_merge_results_args(self):
+        args = self._parse([
+            "--url", "http://localhost:3000/v1/chat/completions",
+            "--merge-results", "peak.json", "queue.json",
+        ])
+        assert args.merge_results == ["peak.json", "queue.json"]
+
 
 # ── _collect_scenarios ───────────────────────────────────────────────────
 
@@ -206,150 +218,498 @@ class TestCollectScenarios:
         assert all(isinstance(r, float) for r in results[0]["rates"])
 
 
-# ── run_queue_depth_discovery ─────────────────────────────────────────────
+# ── run_queue_depth_discovery (3-phase: scout → narrow → confirm) ─────────
+
+def _make_ttft_mock(crossover_n, baseline_ttft=0.1):
+    """Create a mock send_chat_request where TTFT spikes above 10s around crossover_n.
+
+    Below crossover_n: TTFT is low (baseline + small growth).
+    At/above crossover_n: TTFT jumps above 10s.
+    """
+    # Track how many requests are in each "step" (N) to give consistent TTFT per step
+    step_call_counts = {}
+
+    async def mock_send(session, url, req, model, max_tokens, api_key, pbar=None, first_token_event=None):
+        from client_metrics import RequestOutput
+        import time
+        now = time.perf_counter()
+        # Use request_id to determine which N-step this belongs to
+        # We'll rely on the n_requests tracker instead
+        rid = req.request_id
+
+        # Estimate N from how many requests are in this batch
+        # We use a simpler approach: TTFT based on request_id proximity
+        # The mock is called with all N requests for a step — we track via nonlocal
+        n = mock_send._current_n
+        if n < crossover_n:
+            ttft = baseline_ttft + n * 0.01  # Slowly increasing
+        else:
+            ttft = 10.0 + (n - crossover_n) * 2.0  # Spikes above 10s
+
+        return RequestOutput(
+            request_id=rid, success=True,
+            ttft=ttft, e2e_latency=ttft + 5.0,
+            output_tokens=50, prompt_tokens=100, completion_tokens=50,
+            send_time=now, first_token_time=now + ttft,
+        )
+
+    mock_send._current_n = 1
+    return mock_send
+
+
+def _queue_test_args(**overrides):
+    """Standard args namespace for queue discovery tests."""
+    defaults = dict(
+        url="http://test:3000/v1/chat/completions",
+        model="test-model",
+        max_tokens=256,
+        api_key=None,
+        disable_tqdm=True,
+        disable_server_metrics=True,
+        inter_run_wait_seconds=0,
+        queue_ttft_limit=10.0,
+        max_queue_depth=256,
+        queue_confirm_runs=3,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
 
 class TestRunQueueDepthDiscovery:
-    @pytest.mark.asyncio
-    async def test_stops_when_ttft_exceeds_limit(self, tmp_path):
-        """Discovery should stop ramping when avg TTFT exceeds the limit."""
-        call_count = 0
+    """Tests for the 3-phase queue depth discovery: scout → narrow → confirm."""
 
-        async def mock_send(session, url, req, model, max_tokens, api_key, pbar=None, first_token_event=None):
-            nonlocal call_count
-            call_count += 1
-            from client_metrics import RequestOutput
-            import time
-            now = time.perf_counter()
-            # Simulate increasing TTFT: N=1 → 1s, N=2 → 3s, N=3 → 8s, N=4 → 12s (over limit)
-            return RequestOutput(
-                request_id=req.request_id, success=True,
-                ttft=call_count * 3.0, e2e_latency=call_count * 3.0 + 5.0,
-                output_tokens=50, prompt_tokens=100, completion_tokens=50,
-                send_time=now, first_token_time=now + call_count * 3.0,
-            )
+    @pytest.mark.asyncio
+    async def test_scout_uses_exponential_steps(self):
+        """Scout phase should double N: 1, 2, 4, 8, 16, ..."""
+        tested_ns = []
+
+        async def mock_step(session, args, n, requests):
+            tested_ns.append(n)
+            mock_step._current_n = n
+            ttft = 0.1 if n < 20 else 12.0
+            return {
+                "request_rate": n, "num_total": n, "num_successful": n,
+                "avg_prompt_tokens": 100, "avg_completion_tokens": 50,
+                "client_metrics": make_result_bundle(request_rate=n)["client_metrics"],
+                "server_metrics": None,
+                "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []},
+                "avg_ttft_s": ttft,
+            }
+
+        args = _queue_test_args(max_queue_depth=128)
+        with patch("main._run_queue_depth_step", side_effect=mock_step), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(256)]):
+            result = await run_queue_depth_discovery(args, input_len=1024)
+
+        # Scout should have tested exponential sequence up to crossing
+        scout_ns = [r["request_rate"] for r in result["scout_results"]]
+        assert scout_ns[0] == 1
+        # Each step should roughly double
+        for i in range(1, len(scout_ns)):
+            assert scout_ns[i] >= scout_ns[i - 1] * 2 or scout_ns[i] > args.queue_ttft_limit
+
+    @pytest.mark.asyncio
+    async def test_scout_finds_upper_bound(self):
+        """Scout should stop once it finds an N where TTFT > limit."""
+        async def mock_step(session, args, n, requests):
+            ttft = 0.5 if n <= 8 else 15.0  # Crosses at N=16
+            return {
+                "request_rate": n, "num_total": n, "num_successful": n,
+                "avg_prompt_tokens": 100, "avg_completion_tokens": 50,
+                "client_metrics": make_result_bundle(request_rate=n)["client_metrics"],
+                "server_metrics": None,
+                "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []},
+                "avg_ttft_s": ttft,
+            }
+
+        args = _queue_test_args()
+        with patch("main._run_queue_depth_step", side_effect=mock_step), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(256)]):
+            result = await run_queue_depth_discovery(args, input_len=1024)
+
+        # Scout should have found that N=16 is bad
+        scout_ns = [r["request_rate"] for r in result["scout_results"]]
+        last_scout = result["scout_results"][-1]
+        assert last_scout["avg_ttft_s"] > 10.0
+
+    @pytest.mark.asyncio
+    async def test_narrow_binary_searches(self):
+        """Narrow phase should binary search between last_good and first_bad."""
+        async def mock_step(session, args, n, requests):
+            # Crossover at N=12: N<=11 is OK, N>=12 is over limit
+            ttft = 0.5 + n * 0.3 if n <= 11 else 11.0 + (n - 11) * 1.0
+            return {
+                "request_rate": n, "num_total": n, "num_successful": n,
+                "avg_prompt_tokens": 100, "avg_completion_tokens": 50,
+                "client_metrics": make_result_bundle(request_rate=n)["client_metrics"],
+                "server_metrics": None,
+                "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []},
+                "avg_ttft_s": ttft,
+            }
+
+        args = _queue_test_args()
+        with patch("main._run_queue_depth_step", side_effect=mock_step), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(256)]):
+            result = await run_queue_depth_discovery(args, input_len=1024)
+
+        # Narrow phase should have run
+        assert len(result["narrow_results"]) > 0
+        # Should have found max_safe_n close to 11
+        assert result["max_safe_n"] in range(10, 13)
+
+    @pytest.mark.asyncio
+    async def test_confirm_phase_runs(self):
+        """Confirm phase should run multiple times at the found max_safe_n."""
+        async def mock_step(session, args, n, requests):
+            ttft = 0.5 if n <= 10 else 12.0
+            return {
+                "request_rate": n, "num_total": n, "num_successful": n,
+                "avg_prompt_tokens": 100, "avg_completion_tokens": 50,
+                "client_metrics": make_result_bundle(request_rate=n)["client_metrics"],
+                "server_metrics": None,
+                "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []},
+                "avg_ttft_s": ttft,
+            }
+
+        args = _queue_test_args(queue_confirm_runs=3)
+        with patch("main._run_queue_depth_step", side_effect=mock_step), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(256)]):
+            result = await run_queue_depth_discovery(args, input_len=1024)
+
+        # Confirm phase should have 3 results
+        assert len(result["confirm_results"]) == 3
+        # All confirm runs should be at max_safe_n
+        for r in result["confirm_results"]:
+            assert r["request_rate"] == result["max_safe_n"]
+
+    @pytest.mark.asyncio
+    async def test_n1_over_limit_no_narrow_or_confirm(self):
+        """If N=1 is already over limit, skip narrow/confirm and report max_safe_n=0."""
+        async def mock_step(session, args, n, requests):
+            return {
+                "request_rate": n, "num_total": n, "num_successful": n,
+                "avg_prompt_tokens": 100, "avg_completion_tokens": 50,
+                "client_metrics": make_result_bundle(request_rate=n)["client_metrics"],
+                "server_metrics": None,
+                "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []},
+                "avg_ttft_s": 15.0,  # Always over limit
+            }
+
+        args = _queue_test_args()
+        with patch("main._run_queue_depth_step", side_effect=mock_step), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(256)]):
+            result = await run_queue_depth_discovery(args, input_len=1024)
+
+        assert result["max_safe_n"] == 0
+        assert len(result["scout_results"]) == 1
+        assert len(result["narrow_results"]) == 0
+        assert len(result["confirm_results"]) == 0
+
+    @pytest.mark.asyncio
+    async def test_never_exceeds_limit_reports_max(self):
+        """If TTFT never exceeds limit, report max_safe_n = max tested."""
+        async def mock_step(session, args, n, requests):
+            return {
+                "request_rate": n, "num_total": n, "num_successful": n,
+                "avg_prompt_tokens": 100, "avg_completion_tokens": 50,
+                "client_metrics": make_result_bundle(request_rate=n)["client_metrics"],
+                "server_metrics": None,
+                "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []},
+                "avg_ttft_s": 0.5,  # Always under limit
+            }
+
+        args = _queue_test_args(max_queue_depth=32)
+        with patch("main._run_queue_depth_step", side_effect=mock_step), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(256)]):
+            result = await run_queue_depth_discovery(args, input_len=1024)
+
+        # Should have scouted up to max_queue_depth and reported that as safe
+        assert result["max_safe_n"] == 32
+        assert len(result["narrow_results"]) == 0
+        # Should still confirm at max
+        assert len(result["confirm_results"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_all_results_sorted_by_n(self):
+        """all_results should contain every data point sorted by N."""
+        async def mock_step(session, args, n, requests):
+            ttft = 0.5 if n <= 6 else 12.0
+            return {
+                "request_rate": n, "num_total": n, "num_successful": n,
+                "avg_prompt_tokens": 100, "avg_completion_tokens": 50,
+                "client_metrics": make_result_bundle(request_rate=n)["client_metrics"],
+                "server_metrics": None,
+                "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []},
+                "avg_ttft_s": ttft,
+            }
+
+        args = _queue_test_args()
+        with patch("main._run_queue_depth_step", side_effect=mock_step), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(256)]):
+            result = await run_queue_depth_discovery(args, input_len=1024)
+
+        all_ns = [r["request_rate"] for r in result["all_results"]]
+        assert all_ns == sorted(all_ns)
+        # Should include scout + narrow + confirm data
+        total = len(result["scout_results"]) + len(result["narrow_results"]) + len(result["confirm_results"])
+        assert len(result["all_results"]) == total
+
+    @pytest.mark.asyncio
+    async def test_output_has_required_fields(self):
+        """Discovery result should have all expected top-level fields."""
+        async def mock_step(session, args, n, requests):
+            ttft = 0.5 if n <= 5 else 12.0
+            return {
+                "request_rate": n, "num_total": n, "num_successful": n,
+                "avg_prompt_tokens": 100, "avg_completion_tokens": 50,
+                "client_metrics": make_result_bundle(request_rate=n)["client_metrics"],
+                "server_metrics": None,
+                "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []},
+                "avg_ttft_s": ttft,
+            }
+
+        args = _queue_test_args()
+        with patch("main._run_queue_depth_step", side_effect=mock_step), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(256)]):
+            result = await run_queue_depth_discovery(args, input_len=1024)
+
+        assert "input_length" in result
+        assert "max_safe_n" in result
+        assert "ttft_limit" in result
+        assert "scout_results" in result
+        assert "narrow_results" in result
+        assert "confirm_results" in result
+        assert "all_results" in result
+        assert result["input_length"] == 1024
+        assert result["ttft_limit"] == 10.0
+
+    @pytest.mark.asyncio
+    async def test_confirm_failure_drops_max_safe_n(self):
+        """If confirmation runs show TTFT over limit, max_safe_n should drop."""
+        confirm_call = 0
+
+        async def mock_step(session, args, n, requests):
+            nonlocal confirm_call
+            # Crossover at N=8, but confirmation is flaky — 2 of 3 fail
+            if n < 8:
+                ttft = 0.5
+            elif n > 8:
+                ttft = 12.0
+            else:
+                # N=8: first call OK, subsequent calls (confirm) sometimes fail
+                confirm_call += 1
+                ttft = 9.0 if confirm_call <= 1 else 11.0
+            return {
+                "request_rate": n, "num_total": n, "num_successful": n,
+                "avg_prompt_tokens": 100, "avg_completion_tokens": 50,
+                "client_metrics": make_result_bundle(request_rate=n)["client_metrics"],
+                "server_metrics": None,
+                "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []},
+                "avg_ttft_s": ttft,
+            }
+
+        args = _queue_test_args()
+        with patch("main._run_queue_depth_step", side_effect=mock_step), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(256)]):
+            result = await run_queue_depth_discovery(args, input_len=1024)
+
+        # max_safe_n should be less than 8 since confirmation failed
+        assert result["max_safe_n"] < 8
+
+
+# ── run_queue_test (standalone --run-queue-test) ─────────────────────────
+
+class TestRunQueueTest:
+    @pytest.mark.asyncio
+    async def test_saves_queue_summary(self, tmp_path):
+        """Standalone queue test should save queue_summary.json."""
+        async def mock_discovery(args, input_len, max_requests=256):
+            return {
+                "input_length": input_len,
+                "max_safe_n": 10,
+                "ttft_limit": 10.0,
+                "scout_results": [make_result_bundle(request_rate=1)],
+                "narrow_results": [],
+                "confirm_results": [make_result_bundle(request_rate=10)] * 3,
+                "all_results": [make_result_bundle(request_rate=1), make_result_bundle(request_rate=10)],
+            }
 
         args = argparse.Namespace(
             url="http://test:3000/v1/chat/completions",
             model="test-model",
+            model_type="text",
+            num_requests=32,
             max_tokens=256,
-            api_key=None,
-            disable_tqdm=True,
-            disable_server_metrics=True,
+            output_dir=str(tmp_path),
             inter_run_wait_seconds=0,
+            disable_server_metrics=True,
+            disable_tqdm=True,
+            provider=None,
+            gpu="TestGPU",
             queue_ttft_limit=10.0,
-            max_queue_depth=10,
+            max_queue_depth=256,
+            queue_confirm_runs=3,
         )
 
-        with patch("main.send_chat_request", side_effect=mock_send), \
-             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(20)]):
-            results = await run_queue_depth_discovery(args, input_len=1024, max_requests=10)
+        with patch("main.run_queue_depth_discovery", side_effect=mock_discovery), \
+             patch("main._generate_report") as mock_report:
+            from main import run_queue_test
+            await run_queue_test(args, [1024, 4096])
 
-        # Should have stopped before testing all 10
-        assert len(results) < 10
-        # Last result should have TTFT > 10s
-        assert results[-1]["avg_ttft_s"] > 10.0
+        summary_path = os.path.join(str(tmp_path), "queue_summary.json")
+        assert os.path.exists(summary_path)
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert len(summary["scenarios"]) == 2
+        assert summary["scenarios"][0]["max_safe_n"] == 10
+
+        # Verify _generate_report was called
+        mock_report.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_baseline_n1_always_runs(self, tmp_path):
-        """N=1 baseline should always be the first result."""
-        async def mock_send(session, url, req, model, max_tokens, api_key, pbar=None, first_token_event=None):
-            from client_metrics import RequestOutput
-            import time
-            now = time.perf_counter()
-            # Immediately over limit — should still get N=1 result
-            return RequestOutput(
-                request_id=req.request_id, success=True,
-                ttft=15.0, e2e_latency=20.0,
-                output_tokens=50, prompt_tokens=100, completion_tokens=50,
-                send_time=now, first_token_time=now + 15.0,
-            )
+    async def test_queue_summary_compatible_with_convert(self, tmp_path):
+        """queue_summary.json should be convertible via the multi-scenario path."""
+        from convert_results import convert
+
+        async def mock_discovery(args, input_len, max_requests=256):
+            return {
+                "input_length": input_len,
+                "max_safe_n": 8,
+                "ttft_limit": 10.0,
+                "scout_results": [],
+                "narrow_results": [],
+                "confirm_results": [],
+                "all_results": [
+                    make_result_bundle(request_rate=n) for n in [1, 2, 4, 8]
+                ],
+            }
 
         args = argparse.Namespace(
             url="http://test:3000/v1/chat/completions",
             model="test-model",
+            model_type="text",
+            num_requests=32,
             max_tokens=256,
-            api_key=None,
-            disable_tqdm=True,
-            disable_server_metrics=True,
+            output_dir=str(tmp_path),
             inter_run_wait_seconds=0,
+            disable_server_metrics=True,
+            disable_tqdm=True,
+            provider=None,
+            gpu="TestGPU",
             queue_ttft_limit=10.0,
-            max_queue_depth=10,
+            max_queue_depth=256,
+            queue_confirm_runs=3,
         )
 
-        with patch("main.send_chat_request", side_effect=mock_send), \
-             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(20)]):
-            results = await run_queue_depth_discovery(args, input_len=1024, max_requests=10)
+        with patch("main.run_queue_depth_discovery", side_effect=mock_discovery), \
+             patch("main._generate_report"):
+            await run_queue_test(args, [1024])
 
-        # Should have at least the N=1 result
-        assert len(results) >= 1
-        assert results[0]["request_rate"] == 1
+        # Load the saved queue_summary.json and convert it
+        with open(os.path.join(str(tmp_path), "queue_summary.json")) as f:
+            summary = json.load(f)
 
-    @pytest.mark.asyncio
-    async def test_results_have_queue_inference(self):
-        """Each result bundle should contain queue_inference data."""
-        async def mock_send(session, url, req, model, max_tokens, api_key, pbar=None, first_token_event=None):
-            from client_metrics import RequestOutput
-            import time
-            now = time.perf_counter()
-            return RequestOutput(
-                request_id=req.request_id, success=True,
-                ttft=0.5, e2e_latency=5.0,
-                output_tokens=50, prompt_tokens=100, completion_tokens=50,
-                send_time=now, first_token_time=now + 0.5,
-            )
+        report_data = convert(summary, gpu_name="TestGPU")
+        assert "scenarios" in report_data
+        assert report_data["model_name"] == "test-model"
+        # Should have a scenario for the 1024 input length
+        assert len(report_data["scenarios"]) == 1
+
+
+# ── merge_phase1_and_phase2 ──────────────────────────────────────────────
+
+class TestMergePhase1AndPhase2:
+    def test_merge_produces_dual_mode(self, tmp_path):
+        """Merging Phase 1 + Phase 2 JSONs should produce a dual-mode summary."""
+        peak = {
+            "url": "http://test:3000/v1/chat/completions",
+            "model": "test-model",
+            "model_type": "text",
+            "num_requests": 32,
+            "max_tokens": 256,
+            "input_lengths": [1024],
+            "scenarios": [
+                {
+                    "input_length": 1024,
+                    "rates": [1.0, 2.0, 4.0],
+                    "results": [make_result_bundle(request_rate=r) for r in [1, 2, 4]],
+                }
+            ],
+        }
+        queue = {
+            "url": "http://test:3000/v1/chat/completions",
+            "model": "test-model",
+            "model_type": "text",
+            "max_tokens": 256,
+            "ttft_limit": 10.0,
+            "scenarios": [
+                {
+                    "input_length": 1024,
+                    "max_safe_n": 8,
+                    "ttft_limit": 10.0,
+                    "rates": [1.0, 2.0, 4.0, 8.0],
+                    "results": [make_result_bundle(request_rate=r) for r in [1, 2, 4, 8]],
+                }
+            ],
+        }
+
+        peak_path = str(tmp_path / "benchmark_summary.json")
+        queue_path = str(tmp_path / "queue_summary.json")
+        with open(peak_path, "w") as f:
+            json.dump(peak, f)
+        with open(queue_path, "w") as f:
+            json.dump(queue, f)
 
         args = argparse.Namespace(
-            url="http://test:3000/v1/chat/completions",
-            model="test-model",
-            max_tokens=256,
-            api_key=None,
-            disable_tqdm=True,
-            disable_server_metrics=True,
-            inter_run_wait_seconds=0,
-            queue_ttft_limit=2.0,  # Low limit so it stops quickly
-            max_queue_depth=5,
+            output_dir=str(tmp_path / "merged"),
+            provider=None,
+            gpu="TestGPU",
         )
 
-        with patch("main.send_chat_request", side_effect=mock_send), \
-             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(20)]):
-            results = await run_queue_depth_discovery(args, input_len=1024, max_requests=5)
+        with patch("main._generate_report"):
+            merge_phase1_and_phase2(peak_path, queue_path, args)
 
-        for r in results:
-            assert "queue_inference" in r
-            assert "summary_by_depth" in r["queue_inference"]
+        merged_path = str(tmp_path / "merged" / "benchmark_summary.json")
+        assert os.path.exists(merged_path)
+        with open(merged_path) as f:
+            merged = json.load(f)
+        assert merged["dual_mode"] is True
+        assert "peak_performance" in merged
+        assert "queue_depth" in merged
+        assert merged["peak_performance"]["x_label"] == "Concurrent Users"
+        assert merged["queue_depth"]["x_label"] == "Queue Depth (Simultaneous Requests)"
+        assert len(merged["queue_depth"]["scenarios"]) == 1
+        assert len(merged["peak_performance"]["scenarios"]) == 1
 
-    @pytest.mark.asyncio
-    async def test_n_values_are_sequential(self):
-        """N should ramp 1, 2, 3, ... linearly."""
-        async def mock_send(session, url, req, model, max_tokens, api_key, pbar=None, first_token_event=None):
-            from client_metrics import RequestOutput
-            import time
-            now = time.perf_counter()
-            return RequestOutput(
-                request_id=req.request_id, success=True,
-                ttft=0.1, e2e_latency=1.0,
-                output_tokens=50, prompt_tokens=100, completion_tokens=50,
-                send_time=now, first_token_time=now + 0.1,
-            )
+    def test_merge_calls_generate_report(self, tmp_path):
+        """Merge should call _generate_report with the merged data."""
+        peak = {
+            "url": "http://test", "model": "m", "model_type": "text",
+            "num_requests": 10, "max_tokens": 256,
+            "scenarios": [{"input_length": 1024, "rates": [1.0],
+                           "results": [make_result_bundle(request_rate=1)]}],
+        }
+        queue = {
+            "url": "http://test", "model": "m", "model_type": "text",
+            "max_tokens": 256, "ttft_limit": 10.0,
+            "scenarios": [{"input_length": 1024, "max_safe_n": 4, "ttft_limit": 10.0,
+                           "rates": [1.0], "results": [make_result_bundle(request_rate=1)]}],
+        }
 
-        args = argparse.Namespace(
-            url="http://test:3000/v1/chat/completions",
-            model="test-model",
-            max_tokens=256,
-            api_key=None,
-            disable_tqdm=True,
-            disable_server_metrics=True,
-            inter_run_wait_seconds=0,
-            queue_ttft_limit=10.0,
-            max_queue_depth=5,
-        )
+        peak_path = str(tmp_path / "peak.json")
+        queue_path = str(tmp_path / "queue.json")
+        with open(peak_path, "w") as f:
+            json.dump(peak, f)
+        with open(queue_path, "w") as f:
+            json.dump(queue, f)
 
-        with patch("main.send_chat_request", side_effect=mock_send), \
-             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(5)]):
-            results = await run_queue_depth_discovery(args, input_len=1024, max_requests=5)
+        args = argparse.Namespace(output_dir=str(tmp_path), provider=None, gpu="TestGPU")
 
-        n_values = [r["request_rate"] for r in results]
-        assert n_values == [1, 2, 3, 4, 5]
+        with patch("main._generate_report") as mock_report:
+            merge_phase1_and_phase2(peak_path, queue_path, args)
+            mock_report.assert_called_once()
+            call_args = mock_report.call_args[0]
+            assert call_args[0]["dual_mode"] is True
 
 
 # ── run_dual_mode_benchmark ──────────────────────────────────────────────
@@ -363,13 +723,21 @@ class TestRunDualModeBenchmark:
         async def mock_runner(args, x_values, preloaded_requests=None):
             return [make_result_bundle(request_rate=v) for v in x_values]
 
-        # Mock discovery to return a few bundles with avg_ttft_s
-        async def mock_discovery(args, input_len, max_requests=64):
-            return [
-                {**make_result_bundle(request_rate=n), "avg_ttft_s": n * 0.5,
-                 "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []}}
-                for n in [1, 2, 3]
-            ]
+        # Mock discovery to return the new dict format
+        async def mock_discovery(args, input_len, max_requests=256):
+            return {
+                "input_length": input_len,
+                "max_safe_n": 10,
+                "ttft_limit": 10.0,
+                "scout_results": [],
+                "narrow_results": [],
+                "confirm_results": [],
+                "all_results": [
+                    {**make_result_bundle(request_rate=n), "avg_ttft_s": n * 0.5,
+                     "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []}}
+                    for n in [1, 2, 4, 8]
+                ],
+            }
 
         args = argparse.Namespace(
             url="http://test:3000/v1/chat/completions",
@@ -384,7 +752,8 @@ class TestRunDualModeBenchmark:
             provider=None,
             gpu="TestGPU",
             queue_ttft_limit=10.0,
-            max_queue_depth=64,
+            max_queue_depth=256,
+            queue_confirm_runs=3,
         )
 
         with patch("main._collect_scenarios") as mock_collect, \
