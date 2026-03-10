@@ -92,11 +92,11 @@ class TestGetMetric:
         assert len(values) == len(sorted_ids)
         assert all(v is not None and v > 0 for v in values)
 
-    def test_missing_batch_size_returns_none(self):
+    def test_missing_batch_size_returns_zero(self):
         data = make_scenarios_data()
         sorted_ids = _sorted_scenarios(data)
         values = _get_metric(data, sorted_ids, "decode_tps_per_user", 9999)
-        assert all(v is None for v in values)
+        assert all(v == 0.0 for v in values)
 
 
 # ── load_report_json ─────────────────────────────────────────────────────

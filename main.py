@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import time
 from typing import List, Optional
 
@@ -69,7 +70,7 @@ async def _run_queue_depth_step(
 
     Returns a dict with client_metrics, queue_inference, and avg_ttft_s.
     """
-    use_requests = requests[:n]
+    use_requests = random.sample(requests, min(n, len(requests)))
 
     pbar = None if args.disable_tqdm else tqdm(
         total=n, desc=f"N={n}"

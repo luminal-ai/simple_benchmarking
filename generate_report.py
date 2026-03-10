@@ -523,7 +523,7 @@ def _get_metric(
             ),
             None,
         )
-        values.append(m[metric_key] if m else None)
+        values.append(float(m[metric_key]) if m and m.get(metric_key) is not None else 0.0)
     return values
 
 
