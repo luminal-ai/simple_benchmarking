@@ -363,13 +363,27 @@ def build_and_plot(results: List[dict], outdir: str, args):
     _generate_report(summary, outdir, args)
 
 
-async def run_multi_scenario_benchmark(args, rates: List[float], input_lengths: List[int]):
-    """Run benchmarks across multiple input lengths and request rates.
+async def _collect_scenarios(runner_fn, args, x_values, input_lengths: List[int], label: str) -> List[dict]:
+    """Common loop for collecting benchmark scenarios across input lengths.
 
-    Produces a multi-scenario benchmark_summary.json and generates the HTML report
-    with context-length variation on the x-axis.
+    Parameters
+    ----------
+    runner_fn : async callable(args, x_values, preloaded_requests) -> List[dict]
+        Either ``run_multi_rate_benchmark`` or ``run_multi_concurrency_benchmark``.
+    args : argparse.Namespace
+        CLI arguments.
+    x_values : list
+        The rates or concurrency levels to sweep.
+    input_lengths : List[int]
+        Token lengths to iterate over.
+    label : str
+        Human-readable label for progress messages (e.g. "concurrency" or "rate").
+
+    Returns
+    -------
+    List[dict]
+        One scenario dict per input length.
     """
-    _ensure_outdir(args.output_dir)
     all_scenarios = []
 
     for il_idx, input_len in enumerate(input_lengths):
@@ -378,27 +392,36 @@ async def run_multi_scenario_benchmark(args, rates: List[float], input_lengths: 
         print(f"  Scenario {il_idx+1}/{len(input_lengths)}: input_length={input_len} tokens ({il_label})")
         print(f"{'='*60}")
 
-        # Pre-generate requests at this input length
         requests = load_text_dataset_with_length(args.num_requests, input_len, random_sample=True)
-
-        # Run all rates for this input length
-        results = await run_multi_rate_benchmark(args, rates, preloaded_requests=requests)
+        results = await runner_fn(args, x_values, preloaded_requests=requests)
 
         all_scenarios.append({
             "input_length": input_len,
-            "rates": rates,
+            "rates": [float(v) for v in x_values],  # compat with report pipeline
             "results": results,
         })
 
-        # Print per-scenario tables
         print_prefill_decode_tables(results, args.num_requests)
 
-        # Cool down between scenarios
         if il_idx < len(input_lengths) - 1:
             wait_s = max(0, int(args.inter_run_wait_seconds))
             if wait_s > 0:
                 print(f"\nCooling down {wait_s}s before next input length...")
                 await asyncio.sleep(wait_s)
+
+    return all_scenarios
+
+
+async def run_multi_scenario_benchmark(args, rates: List[float], input_lengths: List[int]):
+    """Run benchmarks across multiple input lengths and request rates.
+
+    Produces a multi-scenario benchmark_summary.json and generates the HTML report
+    with context-length variation on the x-axis.
+    """
+    _ensure_outdir(args.output_dir)
+    all_scenarios = await _collect_scenarios(
+        run_multi_rate_benchmark, args, rates, input_lengths, label="rate",
+    )
 
     # Save multi-scenario summary
     summary = {
@@ -424,30 +447,9 @@ async def run_multi_scenario_concurrency_benchmark(args, concurrencies: List[int
     instead of Poisson arrival rates. This ensures exactly N requests in flight.
     """
     _ensure_outdir(args.output_dir)
-    all_scenarios = []
-
-    for il_idx, input_len in enumerate(input_lengths):
-        il_label = f"{input_len // 1024}k" if input_len >= 1024 else str(input_len)
-        print(f"\n{'='*60}")
-        print(f"  Scenario {il_idx+1}/{len(input_lengths)}: input_length={input_len} tokens ({il_label})")
-        print(f"{'='*60}")
-
-        requests = load_text_dataset_with_length(args.num_requests, input_len, random_sample=True)
-        results = await run_multi_concurrency_benchmark(args, concurrencies, preloaded_requests=requests)
-
-        all_scenarios.append({
-            "input_length": input_len,
-            "rates": [float(c) for c in concurrencies],  # compat with report pipeline
-            "results": results,
-        })
-
-        print_prefill_decode_tables(results, args.num_requests)
-
-        if il_idx < len(input_lengths) - 1:
-            wait_s = max(0, int(args.inter_run_wait_seconds))
-            if wait_s > 0:
-                print(f"\nCooling down {wait_s}s before next input length...")
-                await asyncio.sleep(wait_s)
+    all_scenarios = await _collect_scenarios(
+        run_multi_concurrency_benchmark, args, concurrencies, input_lengths, label="concurrency",
+    )
 
     summary = {
         "url": args.url,
@@ -458,6 +460,55 @@ async def run_multi_scenario_concurrency_benchmark(args, concurrencies: List[int
         "input_lengths": input_lengths,
         "rates": [float(c) for c in concurrencies],
         "scenarios": all_scenarios,
+    }
+    _save_json(os.path.join(args.output_dir, "benchmark_summary.json"), summary)
+    _generate_report(summary, args.output_dir, args)
+
+
+async def run_dual_mode_benchmark(args, concurrencies: List[int], rates: List[float], input_lengths: List[int]):
+    """Run both fixed-concurrency and Poisson-rate benchmarks in a single invocation.
+
+    Phase 1 sweeps concurrency levels (peak performance).
+    Phase 2 sweeps request rates (sustained load).
+    A combined summary is saved and passed to report generation.
+    """
+    _ensure_outdir(args.output_dir)
+
+    # --- Phase 1: Peak Performance (Fixed Concurrency) ---
+    print(f"\n{'#'*60}")
+    print("  Phase 1/2: Peak Performance (Fixed Concurrency)")
+    print(f"{'#'*60}")
+    all_concurrency_scenarios = await _collect_scenarios(
+        run_multi_concurrency_benchmark, args, concurrencies, input_lengths, label="concurrency",
+    )
+
+    # --- Phase 2: Sustained Load (Poisson Arrival) ---
+    print(f"\n{'#'*60}")
+    print("  Phase 2/2: Sustained Load (Poisson Arrival)")
+    print(f"{'#'*60}")
+    all_rate_scenarios = await _collect_scenarios(
+        run_multi_rate_benchmark, args, rates, input_lengths, label="rate",
+    )
+
+    # Save combined summary
+    summary = {
+        "url": args.url,
+        "model": args.model,
+        "model_type": getattr(args, 'model_type', 'text'),
+        "num_requests": args.num_requests,
+        "max_tokens": args.max_tokens,
+        "dual_mode": True,
+        "input_lengths": input_lengths,
+        "peak_performance": {
+            "x_label": "Concurrent Users",
+            "x_values": concurrencies,
+            "scenarios": all_concurrency_scenarios,
+        },
+        "sustained_load": {
+            "x_label": "Request Rate (req/s)",
+            "x_values": rates,
+            "scenarios": all_rate_scenarios,
+        },
     }
     _save_json(os.path.join(args.output_dir, "benchmark_summary.json"), summary)
     _generate_report(summary, args.output_dir, args)
@@ -474,23 +525,29 @@ def _generate_report(summary: dict, outdir: str, args):
         report_json_path = os.path.join(outdir, "report_data.json")
         _save_json(report_json_path, report_data)
 
-        # Generate HTML report
-        from generate_report import load_report_json, build_scenario_data, generate_html_report
-        from generate_report import fig_throughput_tradeoff, fig_system_throughput, fig_per_user_speed
-        from generate_report import fig_scaling_efficiency, fig_latency
-
-        df, model_name, gpu_name = load_report_json(report_json_path)
-        sd = build_scenario_data(df)
-
         report_dir = os.path.join(outdir, "report")
         os.makedirs(report_dir, exist_ok=True)
 
-        fig_throughput_tradeoff(df, model_name, report_dir)
-        fig_system_throughput(df, model_name, report_dir)
-        fig_per_user_speed(df, model_name, report_dir)
-        fig_scaling_efficiency(df, model_name, report_dir)
-        fig_latency(df, model_name, report_dir)
-        generate_html_report(df, model_name, gpu_name, sd, report_dir)
+        if report_data.get("dual_mode"):
+            # Dual-mode report: peak performance + sustained load
+            from generate_report import generate_dual_html_report
+            generate_dual_html_report(report_data, report_dir)
+        else:
+            # Single-mode report
+            from generate_report import load_report_json, build_scenario_data, generate_html_report
+            from generate_report import fig_throughput_tradeoff, fig_system_throughput, fig_per_user_speed
+            from generate_report import fig_scaling_efficiency, fig_latency
+
+            df, model_name, gpu_name = load_report_json(report_json_path)
+            sd = build_scenario_data(df)
+
+            fig_throughput_tradeoff(df, model_name, report_dir)
+            fig_system_throughput(df, model_name, report_dir)
+            fig_per_user_speed(df, model_name, report_dir)
+            fig_scaling_efficiency(df, model_name, report_dir)
+            fig_latency(df, model_name, report_dir)
+            generate_html_report(df, model_name, gpu_name, sd, report_dir)
+
         print(f"\nHTML report: {os.path.join(report_dir, 'index.html')}")
     except Exception as e:
         print(f"\nWARNING: Report generation failed: {e}")
@@ -560,10 +617,29 @@ def main():
              "Uses fixed-concurrency mode: exactly N requests in flight at a time. "
              "Mutually exclusive with --rates."
     )
+    parser.add_argument(
+        "--run-dual",
+        action="store_true",
+        help="Run BOTH fixed-concurrency (peak performance) and Poisson-rate (sustained load) "
+             "benchmarks in one invocation. Requires --concurrencies, --rates, and --input-lengths."
+    )
 
     args = parser.parse_args()
 
-    if args.run_multi:
+    if args.run_dual:
+        # Dual-mode requires all three sweep specifications
+        if not args.concurrencies:
+            parser.error("--run-dual requires --concurrencies (e.g., '1,2,4,8,16,32')")
+        if not args.rates:
+            parser.error("--run-dual requires --rates (e.g., '1,10,100')")
+        if not args.input_lengths:
+            parser.error("--run-dual requires --input-lengths (e.g., '512,2048,8192')")
+
+        concurrencies = [int(x.strip()) for x in args.concurrencies.split(",")]
+        rates = parse_rates(args.rates)
+        input_lengths = [int(x.strip()) for x in args.input_lengths.split(",")]
+        asyncio.run(run_dual_mode_benchmark(args, concurrencies, rates, input_lengths))
+    elif args.run_multi:
         if args.concurrencies:
             # Fixed-concurrency mode
             concurrencies = [int(x.strip()) for x in args.concurrencies.split(",")]

@@ -81,6 +81,73 @@ def _make_scenario_name(input_len: int, output_len: int) -> str:
     return f"{in_label}-in-{output_len}-out"
 
 
+def _convert_dual_mode(
+    summary: dict,
+    *,
+    provider_name: Optional[str] = None,
+    gpu_name: Optional[str] = None,
+) -> dict:
+    """Convert a dual-mode benchmark summary into report_data.json format.
+
+    Dual-mode summaries contain both ``peak_performance`` and ``sustained_load``
+    sections, each with their own x-axis label and list of scenarios.
+    """
+    model_name = summary.get("model", "Unknown Model")
+    max_tokens = summary.get("max_tokens", 256)
+    num_requests = summary.get("num_requests", 100)
+
+    report: dict = {
+        "model_name": model_name,
+        "gpu_name": gpu_name or provider_name or "Unknown Provider",
+        "dual_mode": True,
+    }
+
+    for mode_key in ("peak_performance", "sustained_load"):
+        mode_data = summary.get(mode_key)
+        if mode_data is None:
+            continue
+
+        x_label = mode_data.get("x_label", "")
+        scenarios_list = mode_data.get("scenarios", [])
+        converted_scenarios: dict = {}
+
+        for sc in scenarios_list:
+            sc_input_len = sc.get("input_length", 512)
+            sc_results = sc.get("results", [])
+            if not sc_results:
+                continue
+
+            # Estimate output length from data
+            avg_completions = [
+                r["avg_completion_tokens"]
+                for r in sc_results
+                if r.get("avg_completion_tokens", 0) > 0
+            ]
+            output_len = (
+                int(round(sum(avg_completions) / len(avg_completions)))
+                if avg_completions
+                else max_tokens
+            )
+
+            sc_name = _make_scenario_name(sc_input_len, output_len)
+            measured = _convert_results_to_measured(
+                sc_results, sc_input_len, num_requests
+            )
+
+            converted_scenarios[sc_name] = {
+                "input_len": sc_input_len,
+                "output_len": output_len,
+                "measured": measured,
+            }
+
+        report[mode_key] = {
+            "x_label": x_label,
+            "scenarios": converted_scenarios,
+        }
+
+    return report
+
+
 def convert(
     summary: dict,
     *,
@@ -95,6 +162,9 @@ def convert(
     Supports both single-scenario (flat results list) and multi-scenario
     (scenarios list with per-input-length results) formats.
     """
+    if summary.get("dual_mode"):
+        return _convert_dual_mode(summary, provider_name=provider_name, gpu_name=gpu_name)
+
     model_name = summary.get("model", "Unknown Model")
     max_tokens = summary.get("max_tokens", 256)
     num_requests = summary.get("num_requests", 100)
