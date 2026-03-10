@@ -194,9 +194,16 @@ async def run_queue_depth_discovery(
 
     timeout = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
+    async def _warmup(session, n):
+        """Fire a small burst to warm the engine, discard results."""
+        warmup_n = max(1, min(n, 4))
+        print(f"  Warming up (N={warmup_n})...")
+        await _run_queue_depth_step(session, args, warmup_n, requests)
+
     async def _step(session, n, label=""):
         tag = f" [{label}]" if label else ""
         print(f"\n=== Queue depth{tag}: N={n}, input_length={input_len} ===")
+        await _warmup(session, n)
         bundle = await _run_queue_depth_step(session, args, n, requests)
         print(f"  N={n}: avg TTFT = {bundle['avg_ttft_s']:.2f}s (limit: {ttft_limit}s)")
         return bundle
