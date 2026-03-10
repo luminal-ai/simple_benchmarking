@@ -931,25 +931,43 @@ def _generate_report(summary: dict, outdir: str, args):
         report_dir = os.path.join(outdir, "report")
         os.makedirs(report_dir, exist_ok=True)
 
-        if report_data.get("dual_mode"):
-            # Dual-mode report: peak performance + sustained load
-            from generate_report import generate_dual_html_report
-            generate_dual_html_report(report_data, report_dir)
-        else:
-            # Single-mode report
-            from generate_report import load_report_json, build_scenario_data, generate_html_report
-            from generate_report import fig_throughput_tradeoff, fig_system_throughput, fig_per_user_speed
-            from generate_report import fig_scaling_efficiency, fig_latency
+        from generate_report import load_report_json, build_scenario_data, generate_html_report
+        from generate_report import fig_throughput_tradeoff, fig_system_throughput, fig_per_user_speed
+        from generate_report import fig_scaling_efficiency, fig_latency
 
-            df, model_name, gpu_name = load_report_json(report_json_path)
+        def _gen_single_report(rd_path, rd, sub_dir):
+            """Generate a single-mode HTML report from report_data dict."""
+            _save_json(rd_path, rd)
+            os.makedirs(sub_dir, exist_ok=True)
+            df, model_name, gpu_name = load_report_json(rd_path)
             sd = build_scenario_data(df)
+            fig_throughput_tradeoff(df, model_name, sub_dir)
+            fig_system_throughput(df, model_name, sub_dir)
+            fig_per_user_speed(df, model_name, sub_dir)
+            fig_scaling_efficiency(df, model_name, sub_dir)
+            fig_latency(df, model_name, sub_dir)
+            generate_html_report(df, model_name, gpu_name, sd, sub_dir)
 
-            fig_throughput_tradeoff(df, model_name, report_dir)
-            fig_system_throughput(df, model_name, report_dir)
-            fig_per_user_speed(df, model_name, report_dir)
-            fig_scaling_efficiency(df, model_name, report_dir)
-            fig_latency(df, model_name, report_dir)
-            generate_html_report(df, model_name, gpu_name, sd, report_dir)
+        if report_data.get("dual_mode"):
+            # Generate separate reports for each mode
+            model_name = report_data.get("model_name", "Unknown")
+            gpu_name = report_data.get("gpu_name", "Unknown")
+
+            for mode_key, label in [("peak_performance", "peak"), ("queue_depth", "queue")]:
+                mode_data = report_data.get(mode_key)
+                if not mode_data or not mode_data.get("scenarios"):
+                    continue
+                single_rd = {
+                    "model_name": f"{model_name} ({label.title()})",
+                    "gpu_name": gpu_name,
+                    "scenarios": mode_data["scenarios"],
+                }
+                rd_path = os.path.join(outdir, f"report_data_{label}.json")
+                sub_dir = os.path.join(report_dir, label)
+                _gen_single_report(rd_path, single_rd, sub_dir)
+                print(f"  {label.title()} report: {os.path.join(sub_dir, 'index.html')}")
+        else:
+            _gen_single_report(report_json_path, report_data, report_dir)
 
         print(f"\nHTML report: {os.path.join(report_dir, 'index.html')}")
     except Exception as e:
