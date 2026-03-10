@@ -221,7 +221,7 @@ class TestConvertDualMode:
     def test_x_labels_preserved(self, dual_summary):
         report = convert(dual_summary, gpu_name="GPU")
         assert report["peak_performance"]["x_label"] == "Concurrent Users"
-        assert report["queue_depth"]["x_label"] == "Active Users (Queue Depth)"
+        assert report["queue_depth"]["x_label"] == "Queue Depth (Simultaneous Requests)"
 
     def test_measured_points_present(self, dual_summary):
         report = convert(dual_summary, gpu_name="GPU")
@@ -266,7 +266,7 @@ class TestConvertDualModeDirect:
                 "scenarios": [{"input_length": 1024, "results": []}],
             },
             "queue_depth": {
-                "x_label": "Active Users (Queue Depth)",
+                "x_label": "Queue Depth (Simultaneous Requests)",
                 "scenarios": [{"input_length": 1024, "results": [make_result_bundle()]}],
             },
         }

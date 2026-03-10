@@ -20,6 +20,7 @@ from main import (
     run_multi_concurrency_benchmark,
     _collect_scenarios,
     run_dual_mode_benchmark,
+    run_queue_depth_discovery,
     _generate_report,
     main,
 )
@@ -119,7 +120,8 @@ class TestCLIParsing:
         parser.add_argument("--input-lengths", type=str)
         parser.add_argument("--inter-run-wait-seconds", type=int, default=30)
         parser.add_argument("--concurrencies", type=str)
-        parser.add_argument("--queue-depths", type=str)
+        parser.add_argument("--queue-ttft-limit", type=float, default=10.0)
+        parser.add_argument("--max-queue-depth", type=int, default=64)
         parser.add_argument("--run-dual", action="store_true")
         return parser.parse_args(args_list)
 
@@ -134,13 +136,15 @@ class TestCLIParsing:
             "--url", "http://localhost:3000/v1/chat/completions",
             "--run-dual",
             "--concurrencies", "1,2,4,8",
-            "--queue-depths", "0,1,2,4,8",
             "--input-lengths", "1024,4096",
+            "--queue-ttft-limit", "15.0",
+            "--max-queue-depth", "32",
         ])
         assert args.run_dual is True
         assert args.concurrencies == "1,2,4,8"
-        assert args.queue_depths == "0,1,2,4,8"
         assert args.input_lengths == "1024,4096"
+        assert args.queue_ttft_limit == 15.0
+        assert args.max_queue_depth == 32
 
     def test_concurrency_mode_args(self):
         args = self._parse([
@@ -202,6 +206,152 @@ class TestCollectScenarios:
         assert all(isinstance(r, float) for r in results[0]["rates"])
 
 
+# ── run_queue_depth_discovery ─────────────────────────────────────────────
+
+class TestRunQueueDepthDiscovery:
+    @pytest.mark.asyncio
+    async def test_stops_when_ttft_exceeds_limit(self, tmp_path):
+        """Discovery should stop ramping when avg TTFT exceeds the limit."""
+        call_count = 0
+
+        async def mock_send(session, url, req, model, max_tokens, api_key, pbar=None, first_token_event=None):
+            nonlocal call_count
+            call_count += 1
+            from client_metrics import RequestOutput
+            import time
+            now = time.perf_counter()
+            # Simulate increasing TTFT: N=1 → 1s, N=2 → 3s, N=3 → 8s, N=4 → 12s (over limit)
+            return RequestOutput(
+                request_id=req.request_id, success=True,
+                ttft=call_count * 3.0, e2e_latency=call_count * 3.0 + 5.0,
+                output_tokens=50, prompt_tokens=100, completion_tokens=50,
+                send_time=now, first_token_time=now + call_count * 3.0,
+            )
+
+        args = argparse.Namespace(
+            url="http://test:3000/v1/chat/completions",
+            model="test-model",
+            max_tokens=256,
+            api_key=None,
+            disable_tqdm=True,
+            disable_server_metrics=True,
+            inter_run_wait_seconds=0,
+            queue_ttft_limit=10.0,
+            max_queue_depth=10,
+        )
+
+        with patch("main.send_chat_request", side_effect=mock_send), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(20)]):
+            results = await run_queue_depth_discovery(args, input_len=1024, max_requests=10)
+
+        # Should have stopped before testing all 10
+        assert len(results) < 10
+        # Last result should have TTFT > 10s
+        assert results[-1]["avg_ttft_s"] > 10.0
+
+    @pytest.mark.asyncio
+    async def test_baseline_n1_always_runs(self, tmp_path):
+        """N=1 baseline should always be the first result."""
+        async def mock_send(session, url, req, model, max_tokens, api_key, pbar=None, first_token_event=None):
+            from client_metrics import RequestOutput
+            import time
+            now = time.perf_counter()
+            # Immediately over limit — should still get N=1 result
+            return RequestOutput(
+                request_id=req.request_id, success=True,
+                ttft=15.0, e2e_latency=20.0,
+                output_tokens=50, prompt_tokens=100, completion_tokens=50,
+                send_time=now, first_token_time=now + 15.0,
+            )
+
+        args = argparse.Namespace(
+            url="http://test:3000/v1/chat/completions",
+            model="test-model",
+            max_tokens=256,
+            api_key=None,
+            disable_tqdm=True,
+            disable_server_metrics=True,
+            inter_run_wait_seconds=0,
+            queue_ttft_limit=10.0,
+            max_queue_depth=10,
+        )
+
+        with patch("main.send_chat_request", side_effect=mock_send), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(20)]):
+            results = await run_queue_depth_discovery(args, input_len=1024, max_requests=10)
+
+        # Should have at least the N=1 result
+        assert len(results) >= 1
+        assert results[0]["request_rate"] == 1
+
+    @pytest.mark.asyncio
+    async def test_results_have_queue_inference(self):
+        """Each result bundle should contain queue_inference data."""
+        async def mock_send(session, url, req, model, max_tokens, api_key, pbar=None, first_token_event=None):
+            from client_metrics import RequestOutput
+            import time
+            now = time.perf_counter()
+            return RequestOutput(
+                request_id=req.request_id, success=True,
+                ttft=0.5, e2e_latency=5.0,
+                output_tokens=50, prompt_tokens=100, completion_tokens=50,
+                send_time=now, first_token_time=now + 0.5,
+            )
+
+        args = argparse.Namespace(
+            url="http://test:3000/v1/chat/completions",
+            model="test-model",
+            max_tokens=256,
+            api_key=None,
+            disable_tqdm=True,
+            disable_server_metrics=True,
+            inter_run_wait_seconds=0,
+            queue_ttft_limit=2.0,  # Low limit so it stops quickly
+            max_queue_depth=5,
+        )
+
+        with patch("main.send_chat_request", side_effect=mock_send), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(20)]):
+            results = await run_queue_depth_discovery(args, input_len=1024, max_requests=5)
+
+        for r in results:
+            assert "queue_inference" in r
+            assert "summary_by_depth" in r["queue_inference"]
+
+    @pytest.mark.asyncio
+    async def test_n_values_are_sequential(self):
+        """N should ramp 1, 2, 3, ... linearly."""
+        async def mock_send(session, url, req, model, max_tokens, api_key, pbar=None, first_token_event=None):
+            from client_metrics import RequestOutput
+            import time
+            now = time.perf_counter()
+            return RequestOutput(
+                request_id=req.request_id, success=True,
+                ttft=0.1, e2e_latency=1.0,
+                output_tokens=50, prompt_tokens=100, completion_tokens=50,
+                send_time=now, first_token_time=now + 0.1,
+            )
+
+        args = argparse.Namespace(
+            url="http://test:3000/v1/chat/completions",
+            model="test-model",
+            max_tokens=256,
+            api_key=None,
+            disable_tqdm=True,
+            disable_server_metrics=True,
+            inter_run_wait_seconds=0,
+            queue_ttft_limit=10.0,
+            max_queue_depth=5,
+        )
+
+        with patch("main.send_chat_request", side_effect=mock_send), \
+             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(5)]):
+            results = await run_queue_depth_discovery(args, input_len=1024, max_requests=5)
+
+        n_values = [r["request_rate"] for r in results]
+        assert n_values == [1, 2, 3, 4, 5]
+
+
 # ── run_dual_mode_benchmark ──────────────────────────────────────────────
 
 class TestRunDualModeBenchmark:
@@ -213,8 +363,13 @@ class TestRunDualModeBenchmark:
         async def mock_runner(args, x_values, preloaded_requests=None):
             return [make_result_bundle(request_rate=v) for v in x_values]
 
-        async def mock_queue_sweep(args, queue_depths, preloaded_requests):
-            return [make_result_bundle(request_rate=d) for d in queue_depths]
+        # Mock discovery to return a few bundles with avg_ttft_s
+        async def mock_discovery(args, input_len, max_requests=64):
+            return [
+                {**make_result_bundle(request_rate=n), "avg_ttft_s": n * 0.5,
+                 "queue_inference": {"n_requests": n, "inferred": [], "summary_by_depth": []}}
+                for n in [1, 2, 3]
+            ]
 
         args = argparse.Namespace(
             url="http://test:3000/v1/chat/completions",
@@ -228,11 +383,12 @@ class TestRunDualModeBenchmark:
             disable_tqdm=True,
             provider=None,
             gpu="TestGPU",
+            queue_ttft_limit=10.0,
+            max_queue_depth=64,
         )
 
         with patch("main._collect_scenarios") as mock_collect, \
-             patch("main.run_queue_depth_sweep", side_effect=mock_queue_sweep), \
-             patch("main.load_text_dataset_with_length", return_value=[make_request_input(i) for i in range(50)]), \
+             patch("main.run_queue_depth_discovery", side_effect=mock_discovery), \
              patch("main._generate_report") as mock_report:
             mock_collect.return_value = [{
                 "input_length": 1024,
@@ -240,7 +396,7 @@ class TestRunDualModeBenchmark:
                 "results": [mock_bundle, mock_bundle],
             }]
 
-            await run_dual_mode_benchmark(args, [1, 2], [0, 1, 2], [1024])
+            await run_dual_mode_benchmark(args, [1, 2], [1024])
 
             # Check the summary was saved
             summary_path = os.path.join(str(tmp_path), "benchmark_summary.json")
@@ -251,7 +407,7 @@ class TestRunDualModeBenchmark:
             assert "peak_performance" in summary
             assert "queue_depth" in summary
             assert summary["peak_performance"]["x_label"] == "Concurrent Users"
-            assert summary["queue_depth"]["x_label"] == "Active Users (Queue Depth)"
+            assert summary["queue_depth"]["x_label"] == "Queue Depth (Simultaneous Requests)"
 
 
 # ── _generate_report ─────────────────────────────────────────────────────

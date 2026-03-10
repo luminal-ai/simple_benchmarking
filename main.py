@@ -52,125 +52,51 @@ from metrics_printer import (
 from convert_results import convert
 
 
-NUM_QUEUE_PROBES = 10  # Number of probe requests per queue-depth measurement
+QUEUE_DEPTH_TTFT_LIMIT_S = 10.0  # Stop ramping when avg TTFT exceeds this (seconds)
 
 
-async def run_single_benchmark_queue_depth(
-    args, queue_depth: int, preloaded_requests: List[RequestInput]
+async def _run_queue_depth_step(
+    session: aiohttp.ClientSession,
+    args,
+    n: int,
+    requests: List[RequestInput],
 ) -> dict:
-    """Measure new-user experience when queue_depth users are actively decoding.
+    """Fire N requests simultaneously and return metrics + inferred queue depths.
 
-    Starts queue_depth background requests with high max_tokens, waits for all
-    of them to receive their first token (confirming they are in the decode
-    phase), then sends NUM_QUEUE_PROBES probe requests and measures their
-    TTFT and decode speed.  This directly answers: "if K users are being served,
-    what does a new arrival experience?"
+    All N requests are launched at once. The ones that land at the back of
+    vLLM's internal prefill queue experience higher TTFT — that's the queue
+    effect we're measuring.
+
+    Returns a dict with client_metrics, queue_inference, and avg_ttft_s.
     """
-    print(f"\n=== Queue-depth benchmark: depth={queue_depth} ===")
+    use_requests = requests[:n]
 
-    base_url = args.url.rsplit('/v1/', 1)[0] if '/v1/' in args.url else args.url.rsplit('/', 1)[0]
+    pbar = None if args.disable_tqdm else tqdm(
+        total=n, desc=f"N={n}"
+    )
 
-    # Split request pool: backgrounds + probes
-    bg_requests = preloaded_requests[:queue_depth] if queue_depth > 0 else []
-    probe_requests = preloaded_requests[queue_depth:queue_depth + NUM_QUEUE_PROBES]
+    benchmark_start = time.perf_counter()
+    tasks = [
+        asyncio.create_task(send_chat_request(
+            session, args.url, req, args.model,
+            args.max_tokens, args.api_key, pbar=pbar,
+        ))
+        for req in use_requests
+    ]
+    outputs = await asyncio.gather(*tasks)
+    benchmark_duration = time.perf_counter() - benchmark_start
 
-    if not probe_requests:
-        raise ValueError(
-            f"Not enough preloaded requests for depth={queue_depth}. "
-            f"Need at least {queue_depth + NUM_QUEUE_PROBES}, got {len(preloaded_requests)}."
-        )
+    if pbar:
+        pbar.close()
 
-    # Background requests use high max_tokens so they stay alive during probes
-    bg_max_tokens = max(args.max_tokens, 4096)
+    # Compute metrics
+    client_metrics_result = calculate_metrics(outputs, benchmark_duration)
 
-    server_metrics_before = None
-    if not args.disable_server_metrics:
-        server_metrics_before = await fetch_server_metrics(base_url)
+    # Infer queue depths from timestamps
+    inferred = infer_queue_depths(list(outputs))
+    queue_summary = summarize_by_queue_depth(inferred) if inferred else []
 
-    timeout = aiohttp.ClientTimeout(total=6 * 60 * 60)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        if queue_depth == 0:
-            # Baseline — no background load
-            pbar = None if args.disable_tqdm else tqdm(
-                total=len(probe_requests), desc="Probes @depth=0"
-            )
-            benchmark_start = time.perf_counter()
-            probe_outputs = await asyncio.gather(*[
-                send_chat_request(
-                    session, args.url, req, args.model,
-                    args.max_tokens, args.api_key, pbar=pbar,
-                )
-                for req in probe_requests
-            ])
-            benchmark_duration = time.perf_counter() - benchmark_start
-            if pbar:
-                pbar.close()
-        else:
-            # Start backgrounds and wait for them to enter decode phase
-            bg_events = [asyncio.Event() for _ in bg_requests]
-            print(f"  Starting {queue_depth} background requests (max_tokens={bg_max_tokens})...")
-            bg_tasks = [
-                asyncio.create_task(send_chat_request(
-                    session, args.url, req, args.model, bg_max_tokens,
-                    args.api_key, first_token_event=evt,
-                ))
-                for req, evt in zip(bg_requests, bg_events)
-            ]
-
-            # Wait until every background has received its first token
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*[evt.wait() for evt in bg_events]),
-                    timeout=300,  # 5-min safety timeout
-                )
-                print(f"  All {queue_depth} backgrounds are decoding. Sending probes...")
-            except asyncio.TimeoutError:
-                started = sum(1 for e in bg_events if e.is_set())
-                print(f"  WARNING: Only {started}/{queue_depth} backgrounds started "
-                      f"within timeout. Proceeding with probes...")
-
-            # Brief settle so vLLM scheduler stabilises
-            await asyncio.sleep(1.0)
-
-            # Fire probes
-            pbar = None if args.disable_tqdm else tqdm(
-                total=len(probe_requests), desc=f"Probes @depth={queue_depth}"
-            )
-            benchmark_start = time.perf_counter()
-            probe_outputs = await asyncio.gather(*[
-                send_chat_request(
-                    session, args.url, req, args.model,
-                    args.max_tokens, args.api_key, pbar=pbar,
-                )
-                for req in probe_requests
-            ])
-            benchmark_duration = time.perf_counter() - benchmark_start
-            if pbar:
-                pbar.close()
-
-            # Clean up background tasks
-            print(f"  Cancelling {queue_depth} background requests...")
-            for t in bg_tasks:
-                t.cancel()
-            await asyncio.gather(*bg_tasks, return_exceptions=True)
-
-    # --- Metrics (probes only) ---
-    server_metrics_after = None
-    if not args.disable_server_metrics and server_metrics_before:
-        server_metrics_after = await fetch_server_metrics(base_url)
-
-    client_metrics_result = calculate_metrics(probe_outputs, benchmark_duration)
-
-    server_delta = None
-    if server_metrics_before and server_metrics_after:
-        server_delta = calculate_server_metrics_delta(
-            server_metrics_before, server_metrics_after, benchmark_duration
-        )
-
-    print_metrics(client_metrics_result, server_delta, probe_requests)
-
-    successful = [o for o in probe_outputs if o.success]
+    successful = [o for o in outputs if o.success]
     num_successful = len(successful)
     avg_prompt_tokens = (
         sum(o.prompt_tokens for o in successful) / num_successful
@@ -181,9 +107,12 @@ async def run_single_benchmark_queue_depth(
         if num_successful else 0
     )
 
+    # Avg TTFT in seconds for stop condition
+    avg_ttft_s = client_metrics_result.ttft_avg_ms / 1000.0 if num_successful else 0
+
     return {
-        "request_rate": queue_depth,  # downstream uses this as batch_size
-        "num_total": len(probe_outputs),
+        "request_rate": n,  # downstream uses this as batch_size
+        "num_total": len(outputs),
         "num_successful": num_successful,
         "avg_prompt_tokens": avg_prompt_tokens,
         "avg_completion_tokens": avg_completion_tokens,
@@ -213,24 +142,62 @@ async def run_single_benchmark_queue_depth(
                 "avg": client_metrics_result.toks_avg,
             },
         },
-        "server_metrics": server_delta,
+        "server_metrics": None,
+        "queue_inference": {
+            "n_requests": n,
+            "inferred": inferred,
+            "summary_by_depth": queue_summary,
+        },
+        "avg_ttft_s": avg_ttft_s,
     }
 
 
-async def run_queue_depth_sweep(
-    args, queue_depths: List[int], preloaded_requests: List[RequestInput]
+async def run_queue_depth_discovery(
+    args, input_len: int, max_requests: int = 64,
 ) -> List[dict]:
-    """Run queue-depth benchmarks across multiple depth levels."""
-    results = []
-    for idx, depth in enumerate(queue_depths):
-        bundle = await run_single_benchmark_queue_depth(args, depth, preloaded_requests)
-        results.append(bundle)
+    """Adaptively discover queue depth limits for a given input length.
 
-        if idx < len(queue_depths) - 1:
-            wait_s = max(0, int(args.inter_run_wait_seconds))
-            if wait_s > 0:
-                print(f"\nCooling down for {wait_s} seconds before next depth...")
-                await asyncio.sleep(wait_s)
+    Strategy:
+      1. N=1: fire 1 request → baseline TTFT
+      2. N=2, 3, 4, ... (linear ramp)
+      3. Stop when avg TTFT > QUEUE_DEPTH_TTFT_LIMIT_S (10s)
+
+    Returns list of result bundles, one per N tested.
+    """
+    ttft_limit = getattr(args, 'queue_ttft_limit', QUEUE_DEPTH_TTFT_LIMIT_S)
+
+    # Load enough requests for the max we might need
+    requests = load_text_dataset_with_length(max_requests, input_len, random_sample=True)
+
+    results = []
+    timeout = aiohttp.ClientTimeout(total=6 * 60 * 60)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        n = 1
+        while n <= len(requests):
+            print(f"\n=== Queue depth discovery: N={n}, input_length={input_len} ===")
+
+            bundle = await _run_queue_depth_step(session, args, n, requests)
+            avg_ttft = bundle["avg_ttft_s"]
+            results.append(bundle)
+
+            print(f"  N={n}: avg TTFT = {avg_ttft:.2f}s (limit: {ttft_limit}s)")
+
+            if avg_ttft > ttft_limit:
+                print(f"  TTFT exceeded {ttft_limit}s — stopping ramp for this input length.")
+                break
+
+            # Cooldown between steps
+            if n < len(requests):
+                wait_s = max(0, int(args.inter_run_wait_seconds))
+                if wait_s > 0:
+                    print(f"  Cooling down {wait_s}s...")
+                    await asyncio.sleep(wait_s)
+
+            n += 1
+
+    print(f"\n  Queue depth discovery complete for {input_len} tokens: "
+          f"tested N=1..{n}, final avg TTFT={results[-1]['avg_ttft_s']:.2f}s")
 
     return results
 
@@ -340,22 +307,6 @@ async def run_single_benchmark_concurrency(args, concurrency: int, preloaded_req
         },
         "server_metrics": server_delta,
     }
-
-    # Infer queue depth from per-request timestamps
-    inferred = infer_queue_depths(list(outputs))
-    if inferred:
-        bundle["queue_depth_summary"] = summarize_by_queue_depth(inferred)
-        bundle["per_request_timestamps"] = [
-            {
-                "request_id": r["request_id"],
-                "send_time": r["send_time"],
-                "first_token_time": r["first_token_time"],
-                "ttft": r["ttft"],
-                "queue_depth_at_send": r["queue_depth_at_send"],
-                "decoding_at_send": r["decoding_at_send"],
-            }
-            for r in inferred
-        ]
 
     return bundle
 
@@ -667,15 +618,16 @@ async def run_multi_scenario_concurrency_benchmark(args, concurrencies: List[int
     _generate_report(summary, args.output_dir, args)
 
 
-async def run_dual_mode_benchmark(args, concurrencies: List[int], queue_depths: List[int], input_lengths: List[int]):
-    """Run both fixed-concurrency and probe-under-load benchmarks in one invocation.
+async def run_dual_mode_benchmark(args, concurrencies: List[int], input_lengths: List[int]):
+    """Run both fixed-concurrency and queue-depth-discovery benchmarks.
 
     Phase 1 sweeps concurrency levels (peak performance) — all N requests start
     together behind a semaphore, measuring raw GPU capability.
 
-    Phase 2 sweeps queue depths (probe-under-load) — K background requests are
-    actively decoding, then probe requests arrive and we measure the new-user
-    experience.  This answers "if K users are being served, what does user K+1 see?"
+    Phase 2 discovers queue depth limits (adaptive) — for each input length,
+    fires N=1, 2, 3, ... requests simultaneously, measuring TTFT at each level.
+    Stops when avg TTFT exceeds the limit (default 10s).  The result is a curve
+    of queue_depth → TTFT that tells operators exactly when to scale.
     """
     _ensure_outdir(args.output_dir)
 
@@ -687,12 +639,15 @@ async def run_dual_mode_benchmark(args, concurrencies: List[int], queue_depths: 
         run_multi_concurrency_benchmark, args, concurrencies, input_lengths, label="concurrency",
     )
 
-    # --- Phase 2: Queue Depth (Probe-Under-Load) ---
+    # --- Phase 2: Queue Depth Discovery (Adaptive) ---
     print(f"\n{'#'*60}")
-    print("  Phase 2/2: Queue Depth (Probe-Under-Load)")
+    print("  Phase 2/2: Queue Depth Discovery (Adaptive)")
+    print(f"  Stop condition: avg TTFT > {getattr(args, 'queue_ttft_limit', QUEUE_DEPTH_TTFT_LIMIT_S)}s")
     print(f"{'#'*60}")
     all_queue_scenarios = []
-    max_depth = max(queue_depths)
+
+    # Allow enough requests for discovery (up to 64 per input length)
+    max_queue_requests = getattr(args, 'max_queue_depth', 64)
 
     for il_idx, input_len in enumerate(input_lengths):
         il_label = f"{input_len // 1024}k" if input_len >= 1024 else str(input_len)
@@ -700,17 +655,14 @@ async def run_dual_mode_benchmark(args, concurrencies: List[int], queue_depths: 
         print(f"  Scenario {il_idx+1}/{len(input_lengths)}: input_length={input_len} tokens ({il_label})")
         print(f"{'='*60}")
 
-        # Need enough requests for largest depth + probes
-        total_needed = max_depth + NUM_QUEUE_PROBES + 5
-        requests = load_text_dataset_with_length(
-            total_needed, input_len, random_sample=True,
-        )
+        results = await run_queue_depth_discovery(args, input_len, max_requests=max_queue_requests)
 
-        results = await run_queue_depth_sweep(args, queue_depths, requests)
+        # The "rates" here are the N values tested (1, 2, 3, ...)
+        n_values = [float(r["request_rate"]) for r in results]
 
         all_queue_scenarios.append({
             "input_length": input_len,
-            "rates": [float(d) for d in queue_depths],
+            "rates": n_values,
             "results": results,
         })
 
@@ -735,8 +687,8 @@ async def run_dual_mode_benchmark(args, concurrencies: List[int], queue_depths: 
             "scenarios": all_concurrency_scenarios,
         },
         "queue_depth": {
-            "x_label": "Active Users (Queue Depth)",
-            "x_values": queue_depths,
+            "x_label": "Queue Depth (Simultaneous Requests)",
+            "x_values": [float(r["request_rate"]) for r in all_queue_scenarios[0]["results"]] if all_queue_scenarios else [],
             "scenarios": all_queue_scenarios,
         },
     }
@@ -848,18 +800,23 @@ def main():
              "Mutually exclusive with --rates."
     )
     parser.add_argument(
-        "--queue-depths",
-        type=str,
-        help="Comma-separated queue depths for probe-under-load test (e.g., '0,1,2,4,8,16,32'). "
-             "At each depth, K background requests are actively decoding while probe requests "
-             "measure the new-arrival experience.",
+        "--queue-ttft-limit",
+        type=float,
+        default=QUEUE_DEPTH_TTFT_LIMIT_S,
+        help=f"Stop queue depth discovery when avg TTFT exceeds this many seconds (default: {QUEUE_DEPTH_TTFT_LIMIT_S}s).",
+    )
+    parser.add_argument(
+        "--max-queue-depth",
+        type=int,
+        default=64,
+        help="Maximum N to test during queue depth discovery (default: 64).",
     )
     parser.add_argument(
         "--run-dual",
         action="store_true",
-        help="Run BOTH fixed-concurrency (peak performance) and probe-under-load (queue depth) "
+        help="Run BOTH fixed-concurrency (peak performance) and adaptive queue-depth discovery "
              "benchmarks in one invocation. Requires --concurrencies and --input-lengths. "
-             "Use --queue-depths to specify depths (defaults to --concurrencies values with 0 prepended)."
+             "Queue depth ramps N=1,2,3,... until avg TTFT exceeds --queue-ttft-limit."
     )
 
     args = parser.parse_args()
@@ -874,13 +831,7 @@ def main():
         concurrencies = [int(x.strip()) for x in args.concurrencies.split(",")]
         input_lengths = [int(x.strip()) for x in args.input_lengths.split(",")]
 
-        # Queue depths: explicit or derived from concurrencies
-        if args.queue_depths:
-            queue_depths = [int(x.strip()) for x in args.queue_depths.split(",")]
-        else:
-            queue_depths = sorted(set([0] + concurrencies))
-
-        asyncio.run(run_dual_mode_benchmark(args, concurrencies, queue_depths, input_lengths))
+        asyncio.run(run_dual_mode_benchmark(args, concurrencies, input_lengths))
     elif args.run_multi:
         if args.concurrencies:
             # Fixed-concurrency mode

@@ -124,7 +124,7 @@ def make_dual_report_data():
             "scenarios": make_scenarios_data(),
         },
         "queue_depth": {
-            "x_label": "Active Users (Queue Depth)",
+            "x_label": "Queue Depth (Simultaneous Requests)",
             "scenarios": make_scenarios_data(),
         },
     }
@@ -183,6 +183,7 @@ def make_benchmark_summary(
 
     if dual_mode:
         concs = [1, 2, 4, 8]
+        queue_n = [1, 2, 3, 4, 5]  # Adaptive discovery results
         base["dual_mode"] = True
         base["peak_performance"] = {
             "x_label": "Concurrent Users",
@@ -190,9 +191,9 @@ def make_benchmark_summary(
             "scenarios": _make_scenario_results([float(c) for c in concs]),
         }
         base["queue_depth"] = {
-            "x_label": "Active Users (Queue Depth)",
-            "x_values": [0] + concs,
-            "scenarios": _make_scenario_results([0.0] + [float(c) for c in concs]),
+            "x_label": "Queue Depth (Simultaneous Requests)",
+            "x_values": [float(n) for n in queue_n],
+            "scenarios": _make_scenario_results([float(n) for n in queue_n]),
         }
     else:
         base["rates"] = rates
